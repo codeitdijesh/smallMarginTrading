@@ -16,13 +16,26 @@ load_dotenv(BASE_DIR / ".env")
 # API Configuration
 KALSHI_ENV = os.getenv("KALSHI_ENV", "prod").lower()
 DEMO_API_URL = "https://demo-api.kalshi.co/trade-api/v2"
-PROD_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
+PROD_API_URL = os.getenv("KALSHI_PROD_URL", "https://external-api.kalshi.com/trade-api/v2")
 
 API_BASE_URL = DEMO_API_URL if KALSHI_ENV == "demo" else PROD_API_URL
 
-# Credentials (for authenticated live/demo trading)
-KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", os.getenv("KALSHI_API", "")).strip()
-KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "").strip()
+# Credentials (for authenticated live/demo trading with multiple alias support)
+KALSHI_API_KEY_ID = (
+    os.getenv("KALSHI_API_KEY_ID") or
+    os.getenv("KALSHI_API_KEY") or
+    os.getenv("KALSHI_KEY_ID") or
+    os.getenv("KALSHI_API") or
+    ""
+).strip()
+
+KALSHI_PRIVATE_KEY = (
+    os.getenv("KALSHI_PRIVATE_KEY") or
+    os.getenv("KALSHI_RSA_PRIVATE_KEY") or
+    os.getenv("KALSHI_SECRET_KEY") or
+    ""
+).strip()
+
 KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
 
 # ---------------- Strategy Parameters (Per PRD) ---------------- #

@@ -44,8 +44,9 @@ class KalshiClient:
         try:
             # 1. Try from inline PEM string
             if pem_str and "-----BEGIN" in pem_str:
+                formatted_pem = pem_str.replace("\\n", "\n").strip()
                 self.private_key = serialization.load_pem_private_key(
-                    pem_str.encode("utf-8"),
+                    formatted_pem.encode("utf-8"),
                     password=None,
                     backend=default_backend()
                 )
@@ -150,6 +151,10 @@ class KalshiClient:
     # Authenticated Portfolio & Order Management
     def get_balance(self) -> Optional[Dict[str, Any]]:
         """Retrieves account balance and available cash."""
+        if not self.is_authenticated:
+            logger.error("Cannot fetch balance: API Key ID or RSA Private Key is missing.")
+            return None
+
         resp = self._request("GET", "portfolio/balance", auth_required=True)
         if resp and resp.status_code == 200:
             data = resp.json()
@@ -160,7 +165,9 @@ class KalshiClient:
                 "raw": data
             }
         elif resp:
-            logger.error(f"Failed to fetch balance ({resp.status_code}): {resp.text}")
+            logger.error(f"Failed to fetch live balance (HTTP {resp.status_code}): {resp.text}")
+        else:
+            logger.error("Failed to fetch live balance: No response from Kalshi API.")
         return None
 
     def get_positions(self, status: str = "open") -> Optional[Dict[str, Any]]:

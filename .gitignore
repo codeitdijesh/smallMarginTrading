@@ -10,5 +10,7 @@ logs/
 .vscode/
 .idea/
 paper_trading_state.json
+live_trading_state.json
+*_trading_state.json
 smalltrade.txt
 !requirements.txt

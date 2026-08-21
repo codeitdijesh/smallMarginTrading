@@ -40,18 +40,22 @@ class TradingBot:
             max_exposure_pct=MAX_TOTAL_EXPOSURE_PERCENT,
             stop_loss_drop=STOP_LOSS_PRICE_DROP
         )
-        self.state_file = state_file or (BASE_DIR / "paper_trading_state.json")
+        self.state_file = state_file or (BASE_DIR / f"{self.mode}_trading_state.json")
         self.active_positions: Dict[str, Dict[str, Any]] = {}
         self.closed_positions: List[Dict[str, Any]] = []
 
+        self.live_balance_loaded = False
         if self.mode == "live":
             if not self.client.is_authenticated:
-                logger.error("Live mode requires valid Kalshi RSA credentials (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY).")
+                logger.error("Live mode requires valid Kalshi RSA credentials (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY). Defaulting to fallback bankroll.")
             else:
                 live_bal = self.client.get_balance()
                 if live_bal and "balance_dollars" in live_bal:
                     bankroll = live_bal["balance_dollars"]
+                    self.live_balance_loaded = True
                     logger.info(f"Retrieved Live Kalshi Balance: ${bankroll:.2f}")
+                else:
+                    logger.warning(f"Could not retrieve live balance from Kalshi API. Using fallback bankroll: ${bankroll:.2f}")
 
         self.bankroll = bankroll
         self.initial_bankroll = bankroll
@@ -222,8 +226,9 @@ class TradingBot:
             try:
                 with open(self.state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.bankroll = data.get("bankroll", self.bankroll)
-                    self.initial_bankroll = data.get("initial_bankroll", self.initial_bankroll)
+                    if not (self.mode == "live" and self.live_balance_loaded):
+                        self.bankroll = data.get("bankroll", self.bankroll)
+                        self.initial_bankroll = data.get("initial_bankroll", self.initial_bankroll)
                     self.active_positions = data.get("active_positions", {})
                     self.closed_positions = data.get("closed_positions", [])
                     logger.info(f"Loaded existing trading state from {self.state_file}")
