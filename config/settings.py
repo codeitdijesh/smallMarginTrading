@@ -18,7 +18,9 @@ KALSHI_ENV = os.getenv("KALSHI_ENV", "prod").lower()
 DEMO_API_URL = "https://demo-api.kalshi.co/trade-api/v2"
 PROD_API_URL = os.getenv("KALSHI_PROD_URL", "https://external-api.kalshi.com/trade-api/v2")
 
-API_BASE_URL = DEMO_API_URL if KALSHI_ENV == "demo" else PROD_API_URL
+# Market scanner always uses live liquid production markets by default
+SCANNER_API_URL = os.getenv("KALSHI_SCANNER_URL", PROD_API_URL)
+API_BASE_URL = SCANNER_API_URL
 
 # Credentials (for authenticated live/demo trading with multiple alias support)
 KALSHI_API_KEY_ID = (

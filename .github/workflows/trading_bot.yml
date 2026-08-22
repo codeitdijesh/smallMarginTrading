@@ -51,10 +51,10 @@ jobs:
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID || secrets.KALSHI_API_KEY || secrets.KALSHI_KEY_ID || secrets.KALSHI_API }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY || secrets.KALSHI_RSA_PRIVATE_KEY || secrets.KALSHI_SECRET_KEY }}
-          KALSHI_ENV: ${{ github.event.inputs.environment || secrets.KALSHI_ENV || 'prod' }}
+          KALSHI_ENV: ${{ github.event.inputs.environment || 'prod' }}
         run: |
           MODE="${{ github.event.inputs.mode || 'live' }}"
-          ENV_NAME="${{ github.event.inputs.environment || secrets.KALSHI_ENV || 'prod' }}"
+          ENV_NAME="${{ github.event.inputs.environment || 'prod' }}"
           echo "Executing Kalshi Trading Bot in $MODE mode on $ENV_NAME..."
           python main.py bot --mode "$MODE" --env "$ENV_NAME"
 

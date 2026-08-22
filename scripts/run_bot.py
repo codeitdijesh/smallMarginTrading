@@ -33,7 +33,7 @@ from src.utils.logger import logger
 def main():
     parser = argparse.ArgumentParser(description="Kalshi High-Probability Trading Bot")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper", help="Execution mode: 'paper' (simulated) or 'live' (real orders)")
-    parser.add_argument("--env", choices=["prod", "demo"], default=KALSHI_ENV, help=f"API environment for market feeds (default: {KALSHI_ENV})")
+    parser.add_argument("--env", choices=["prod", "demo"], default="prod", help="Execution environment for live orders (default: prod)")
     parser.add_argument("--bankroll", type=float, default=BANKROLL_START, help="Initial bankroll for paper trading ($)")
     parser.add_argument("--max-hours", type=float, default=MAX_HOURS_TO_EXPIRY, help=f"Max hours to settlement (default: {MAX_HOURS_TO_EXPIRY})")
     parser.add_argument("--min-prob", type=float, default=MIN_PROBABILITY, help=f"Min probability (default: {MIN_PROBABILITY})")
@@ -43,11 +43,12 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Interval in seconds between cycles when looping (default: 300s)")
     args = parser.parse_args()
 
-    api_url = PROD_API_URL if args.env == "prod" else DEMO_API_URL
+    order_api_url = PROD_API_URL if args.env == "prod" else DEMO_API_URL
+    scanner_api_url = PROD_API_URL  # Real-time liquid production orderbooks
 
-    client = KalshiClient(base_url=api_url if args.mode == "live" else api_url)
+    client = KalshiClient(base_url=order_api_url)
     scanner = MarketScanner(
-        base_url=api_url,
+        base_url=scanner_api_url,
         min_prob=args.min_prob,
         max_prob=args.max_prob,
         max_hours=args.max_hours,
