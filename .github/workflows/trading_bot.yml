@@ -54,5 +54,14 @@ jobs:
           KALSHI_ENV: ${{ github.event.inputs.environment || secrets.KALSHI_ENV || 'prod' }}
         run: |
           MODE="${{ github.event.inputs.mode || 'live' }}"
-          echo "Executing Kalshi Trading Bot in $MODE mode on $KALSHI_ENV..."
-          python main.py bot --mode "$MODE"
+          ENV_NAME="${{ github.event.inputs.environment || secrets.KALSHI_ENV || 'prod' }}"
+          echo "Executing Kalshi Trading Bot in $MODE mode on $ENV_NAME..."
+          python main.py bot --mode "$MODE" --env "$ENV_NAME"
+
+      - name: Upload Trading State Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-state
+          path: "*_trading_state.json"
+          if-no-files-found: ignore

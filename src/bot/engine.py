@@ -71,32 +71,70 @@ class TradingBot:
         """Cash available for new trades."""
         return max(0.0, self.bankroll - self.total_exposure)
 
+    def sync_live_positions(self):
+        """Syncs active positions and resting orders from Kalshi API when authenticated in live mode."""
+        if self.mode != "live" or not self.client.is_authenticated:
+            return
+
+        try:
+            positions_data = self.client.get_positions(status="open")
+            if positions_data:
+                market_positions = positions_data.get("market_positions", [])
+                for mp in market_positions:
+                    ticker = mp.get("ticker")
+                    pos_count = mp.get("position", 0)
+                    if not ticker or pos_count == 0:
+                        continue
+                    side = "yes" if pos_count > 0 else "no"
+                    pos_key = f"{ticker}_{side}"
+                    if pos_key not in self.active_positions:
+                        event_ticker = ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
+                        series_ticker = ticker.split("-")[0] if "-" in ticker else ticker
+                        self.active_positions[pos_key] = {
+                            "ticker": ticker,
+                            "event_ticker": event_ticker,
+                            "series_ticker": series_ticker,
+                            "title": ticker,
+                            "side": side,
+                            "entry_price": float(mp.get("market_exposure", 0)) / max(1, abs(pos_count)),
+                            "contracts": abs(pos_count),
+                            "total_cost": float(mp.get("market_exposure", 0)),
+                            "est_fee": 0.0,
+                            "est_net_profit": 0.0,
+                            "roi_percent": 0.0,
+                            "hours_left": 0.0,
+                            "close_time": "Live Position",
+                            "mode": "live",
+                            "synced_from_api": True,
+                            "entered_at": datetime.now(timezone.utc).isoformat()
+                        }
+        except Exception as e:
+            logger.warning(f"Could not sync live positions from API: {e}")
+
     def execute_scan_cycle(self) -> List[Dict[str, Any]]:
         """
         Executes one full scan & trade cycle:
-        1. Query live balance if in live mode
-        2. Scan opportunities
-        3. Filter and size positions (5% bankroll, 75% max exposure)
-        4. Enter orders (paper simulated or live API)
+        1. Query live balance and sync positions if in live mode
+        2. Scan opportunities (with native time windowing and event-level deduplication)
+        3. Validate against strict risk controls (5% position size, 1 position/5% per event, 75% max exposure)
+        4. Enter orders (paper simulated or live API limit order)
         """
         if self.mode == "live" and self.client.is_authenticated:
             live_bal = self.client.get_balance()
             if live_bal and "balance_dollars" in live_bal:
                 self.bankroll = live_bal["balance_dollars"]
+            self.sync_live_positions()
 
         logger.info(f"--- Starting {self.mode.upper()} Cycle | Bankroll: ${self.bankroll:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")
-        opportunities = self.scanner.scan_all_opportunities()
+        opportunities = self.scanner.scan_all_opportunities(dedup_by_event=True)
 
         entered_trades = []
 
         for opp in opportunities:
             ticker = opp["ticker"]
             side = opp["side"]
+            event_ticker = opp.get("event_ticker") or (ticker.rsplit("-", 1)[0] if "-" in ticker else ticker)
             pos_key = f"{ticker}_{side}"
-
-            # Skip if already holding position in this market & side
-            if pos_key in self.active_positions:
-                continue
 
             price = opp["ask_price"]
             # Sizing: 5% of total bankroll
@@ -106,10 +144,11 @@ class TradingBot:
 
             total_cost = round(contracts * price, 2)
 
-            # Exposure check: Max 75% total exposure
-            approved, reason = self.risk_manager.validate_exposure(
+            # Comprehensive multi-layer risk validation (ticker deduplication, event limit, series limit, portfolio ceiling)
+            approved, reason = self.risk_manager.validate_candidate_trade(
                 self.bankroll,
-                self.total_exposure,
+                self.active_positions,
+                opp,
                 total_cost
             )
 
@@ -138,6 +177,8 @@ class TradingBot:
             econ = calculate_contract_economics(price)
             pos = {
                 "ticker": ticker,
+                "event_ticker": event_ticker,
+                "series_ticker": opp.get("series_ticker"),
                 "title": opp["title"],
                 "side": side,
                 "entry_price": price,
@@ -156,7 +197,7 @@ class TradingBot:
             self.active_positions[pos_key] = pos
             entered_trades.append(pos)
             logger.info(
-                f"[{self.mode.upper()} ORDER PLACED] {ticker} -> {opp['action']} | {contracts} contracts @ ${price:.2f} "
+                f"[{self.mode.upper()} ORDER PLACED] {ticker} ({event_ticker}) -> {opp['action']} | {contracts} contracts @ ${price:.2f} "
                 f"(Cost: ${total_cost:.2f}, Est Net: +${pos['est_net_profit']:.2f})"
             )
 

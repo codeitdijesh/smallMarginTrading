@@ -1,10 +1,11 @@
 """
 Market Scanner Module.
 Scans Kalshi markets for high-probability (>90%), short-dated (<24h) intraday opportunities
-with tight spreads and net positive expected value.
+with tight spreads, strong liquidity, and net positive expected value.
 """
 
 from datetime import datetime, timezone
+import time
 from typing import List, Dict, Any, Optional
 import requests
 
@@ -38,12 +39,21 @@ class MarketScanner:
         self.max_spread = max_spread
         self.min_oi = min_oi
 
-    def fetch_open_markets(self, max_pages: int = 15) -> List[Dict[str, Any]]:
-        """Fetches active open markets with pagination."""
+    def fetch_open_markets(self, max_pages: int = 20, max_hours: Optional[float] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches active open markets using Kalshi API v2 native time filtering (min_close_ts and max_close_ts).
+        Filters out illiquid multi-variable combo (MVE) markets.
+        """
+        hours = max_hours if max_hours is not None else self.max_hours
+        now_ts = int(time.time())
+        # Buffer min_close_ts by 60s to ensure markets have not already settled
+        min_close_ts = now_ts + 60
+        max_close_ts = now_ts + int(hours * 3600)
+
         markets = []
         cursor = ""
-        for _ in range(max_pages):
-            url = f"{self.base_url}/markets?limit=200&status=open"
+        for page in range(max_pages):
+            url = f"{self.base_url}/markets?status=open&min_close_ts={min_close_ts}&max_close_ts={max_close_ts}&limit=200"
             if cursor:
                 url += f"&cursor={cursor}"
             try:
@@ -53,13 +63,23 @@ class MarketScanner:
                     break
                 data = resp.json()
                 batch = data.get("markets", [])
-                markets.extend(batch)
+                
+                # Filter out synthetic / combo MVE markets
+                clean_batch = [
+                    m for m in batch
+                    if "CROSSCATEGORY" not in m.get("ticker", "")
+                    and "MVE" not in m.get("ticker", "")
+                    and not m.get("mve_collection_ticker")
+                ]
+                markets.extend(clean_batch)
+
                 cursor = data.get("cursor")
                 if not cursor or not batch:
                     break
             except Exception as e:
                 logger.error(f"Error querying {url}: {e}")
                 break
+
         return markets
 
     def fetch_series_markets(self, series_ticker: str) -> List[Dict[str, Any]]:
@@ -68,7 +88,13 @@ class MarketScanner:
         try:
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
-                return resp.json().get("markets", [])
+                markets = resp.json().get("markets", [])
+                return [
+                    m for m in markets
+                    if "CROSSCATEGORY" not in m.get("ticker", "")
+                    and "MVE" not in m.get("ticker", "")
+                    and not m.get("mve_collection_ticker")
+                ]
         except Exception as e:
             logger.debug(f"Error fetching series {series_ticker}: {e}")
         return []
@@ -82,7 +108,7 @@ class MarketScanner:
             now = datetime.now(timezone.utc)
 
         ticker = market.get("ticker", "")
-        if not ticker or "CROSSCATEGORY" in ticker:
+        if not ticker or "CROSSCATEGORY" in ticker or "MVE" in ticker or market.get("mve_collection_ticker"):
             return []
 
         close_time_str = market.get("close_time") or market.get("expiration_time")
@@ -105,6 +131,9 @@ class MarketScanner:
         if oi < self.min_oi:
             return []
 
+        event_ticker = market.get("event_ticker") or (ticker.rsplit("-", 1)[0] if "-" in ticker else ticker)
+        series_ticker = market.get("series_ticker") or (ticker.split("-")[0] if "-" in ticker else ticker)
+
         yes_bid = float(market.get("yes_bid_dollars") or 0)
         yes_ask = float(market.get("yes_ask_dollars") or 0)
         no_bid = float(market.get("no_bid_dollars") or 0)
@@ -119,6 +148,8 @@ class MarketScanner:
             if econ["is_profitable"]:
                 results.append({
                     "ticker": ticker,
+                    "event_ticker": event_ticker,
+                    "series_ticker": series_ticker,
                     "title": title,
                     "side": "yes",
                     "action": "BUY YES",
@@ -143,6 +174,8 @@ class MarketScanner:
             if econ["is_profitable"]:
                 results.append({
                     "ticker": ticker,
+                    "event_ticker": event_ticker,
+                    "series_ticker": series_ticker,
                     "title": title,
                     "side": "no",
                     "action": "BUY NO",
@@ -163,41 +196,75 @@ class MarketScanner:
 
         return results
 
-    def scan_all_opportunities(self, max_pages: int = 15, include_targeted_series: bool = True) -> List[Dict[str, Any]]:
-        """Scans all open markets via pagination and optionally queries high-volume daily series."""
-        logger.info(f"Scanning open markets from {self.base_url}...")
+    def scan_all_opportunities(
+        self,
+        max_pages: int = 20,
+        include_targeted_series: bool = True,
+        dedup_by_event: bool = True,
+        now: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Scans all open markets using native time-windowed query and targeted daily series.
+        If dedup_by_event is True, selects the best single opportunity per event
+        (highest ROI, tightest spread, best liquidity) to prevent overexposure to correlated strikes.
+        """
+        logger.info(f"Scanning open markets (<{self.max_hours:.0f}h) from {self.base_url}...")
         markets = self.fetch_open_markets(max_pages=max_pages)
-        now = datetime.now(timezone.utc)
-        candidates = []
-        seen_keys = set()
+        if now is None:
+            now = datetime.now(timezone.utc)
+        all_candidates = []
+        seen_market_sides = set()
 
         for m in markets:
             for opp in self.evaluate_market(m, now):
                 key = (opp["ticker"], opp["side"])
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    candidates.append(opp)
+                if key not in seen_market_sides:
+                    seen_market_sides.add(key)
+                    all_candidates.append(opp)
 
         if include_targeted_series:
-            logger.info(f"Scanning {len(DAILY_SERIES)} high-volume targeted daily series...")
+            logger.info(f"Scanning {len(DAILY_SERIES)} targeted daily series...")
             for s in DAILY_SERIES:
                 for m in self.fetch_series_markets(s):
                     for opp in self.evaluate_market(m, now):
                         key = (opp["ticker"], opp["side"])
-                        if key not in seen_keys:
-                            seen_keys.add(key)
-                            candidates.append(opp)
+                        if key not in seen_market_sides:
+                            seen_market_sides.add(key)
+                            all_candidates.append(opp)
 
-        # Sort primarily by time to expiry (fastest turnover), secondarily by open interest
-        candidates.sort(key=lambda x: (x["hours_left"], -x["oi"]))
-        logger.info(f"Scan complete: {len(candidates)} high-probability intraday opportunities found.")
-        return candidates
+        if not dedup_by_event:
+            all_candidates.sort(key=lambda x: (x["hours_left"], -x["roi_percent"], -x["oi"]))
+            logger.info(f"Scan complete: {len(all_candidates)} opportunities found (All strikes).")
+            return all_candidates
 
-    def scan_targeted_series(self, series_list: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        # Group by event_ticker and select best opportunity per event
+        event_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for opp in all_candidates:
+            ev = opp["event_ticker"]
+            if ev not in event_groups:
+                event_groups[ev] = []
+            event_groups[ev].append(opp)
+
+        deduped_candidates = []
+        for ev, group in event_groups.items():
+            # Rank opportunities in this event: highest ROI, then lowest spread, then highest OI
+            group.sort(key=lambda x: (-x["roi_percent"], x["spread"], -x["oi"]))
+            deduped_candidates.append(group[0])
+
+        # Sort final list primarily by time to expiry (fastest turnover), secondarily by ROI and OI
+        deduped_candidates.sort(key=lambda x: (x["hours_left"], -x["roi_percent"], -x["oi"]))
+        logger.info(
+            f"Scan complete: {len(deduped_candidates)} diversified event opportunities found "
+            f"(Filtered from {len(all_candidates)} total market candidates)."
+        )
+        return deduped_candidates
+
+    def scan_targeted_series(self, series_list: Optional[List[str]] = None, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """Scans specific high-turnover daily series (Weather, Crypto, Sports, Indices)."""
         series = series_list or DAILY_SERIES
         logger.info(f"Scanning {len(series)} targeted daily series...")
-        now = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
         candidates = []
         seen_keys = set()
 
@@ -210,5 +277,5 @@ class MarketScanner:
                         seen_keys.add(key)
                         candidates.append(opp)
 
-        candidates.sort(key=lambda x: (x["hours_left"], -x["oi"]))
+        candidates.sort(key=lambda x: (x["hours_left"], -x["roi_percent"], -x["oi"]))
         return candidates

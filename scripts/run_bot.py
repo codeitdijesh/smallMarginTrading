@@ -11,27 +11,63 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.settings import BANKROLL_START, API_BASE_URL
+from config.settings import (
+    BANKROLL_START,
+    API_BASE_URL,
+    PROD_API_URL,
+    DEMO_API_URL,
+    KALSHI_ENV,
+    MIN_PROBABILITY,
+    MAX_PROBABILITY,
+    MAX_HOURS_TO_EXPIRY,
+    MAX_BID_ASK_SPREAD,
+    MIN_OPEN_INTEREST,
+    MAX_POSITIONS_PER_EVENT
+)
 from src.bot.engine import TradingBot
 from src.strategy.scanner import MarketScanner
+from src.strategy.risk import RiskManager
 from src.api.kalshi_client import KalshiClient
 from src.utils.logger import logger
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi High-Probability Trading Bot")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper", help="Execution mode: 'paper' (simulated) or 'live' (real orders)")
+    parser.add_argument("--env", choices=["prod", "demo"], default=KALSHI_ENV, help=f"API environment for market feeds (default: {KALSHI_ENV})")
     parser.add_argument("--bankroll", type=float, default=BANKROLL_START, help="Initial bankroll for paper trading ($)")
+    parser.add_argument("--max-hours", type=float, default=MAX_HOURS_TO_EXPIRY, help=f"Max hours to settlement (default: {MAX_HOURS_TO_EXPIRY})")
+    parser.add_argument("--min-prob", type=float, default=MIN_PROBABILITY, help=f"Min probability (default: {MIN_PROBABILITY})")
+    parser.add_argument("--max-prob", type=float, default=MAX_PROBABILITY, help=f"Max probability (default: {MAX_PROBABILITY})")
+    parser.add_argument("--max-per-event", type=int, default=MAX_POSITIONS_PER_EVENT, help=f"Max positions allowed per event (default: {MAX_POSITIONS_PER_EVENT})")
     parser.add_argument("--loop", action="store_true", help="Run continuously in a loop")
     parser.add_argument("--interval", type=int, default=300, help="Interval in seconds between cycles when looping (default: 300s)")
     args = parser.parse_args()
 
-    client = KalshiClient(base_url=API_BASE_URL)
-    scanner = MarketScanner(base_url=API_BASE_URL)
-    bot = TradingBot(mode=args.mode, bankroll=args.bankroll, scanner=scanner, client=client)
+    api_url = PROD_API_URL if args.env == "prod" else DEMO_API_URL
+
+    client = KalshiClient(base_url=api_url if args.mode == "live" else api_url)
+    scanner = MarketScanner(
+        base_url=api_url,
+        min_prob=args.min_prob,
+        max_prob=args.max_prob,
+        max_hours=args.max_hours,
+        max_spread=MAX_BID_ASK_SPREAD,
+        min_oi=MIN_OPEN_INTEREST
+    )
+    risk_manager = RiskManager(
+        max_positions_per_event=args.max_per_event
+    )
+    bot = TradingBot(
+        mode=args.mode,
+        bankroll=args.bankroll,
+        scanner=scanner,
+        risk_manager=risk_manager,
+        client=client
+    )
 
     print("\n" + "="*80)
     print(f" KALSHI HIGH-PROBABILITY TRADING BOT [{args.mode.upper()} MODE]")
-    print(f" Strategy: >90% Win Chance, <24h Expiry, 5% Bankroll Sizing, 75% Exposure Cap")
+    print(f" Strategy: {args.min_prob*100:.0f}%-{args.max_prob*100:.0f}% Win Chance, <{args.max_hours:.0f}h Expiry, Max {args.max_per_event} Bet/Event")
     print("="*80)
 
     try:
