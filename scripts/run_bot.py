@@ -32,8 +32,8 @@ from src.utils.logger import logger
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi High-Probability Trading Bot")
-    parser.add_argument("--mode", choices=["paper", "live"], default="paper", help="Execution mode: 'paper' (simulated) or 'live' (real orders)")
-    parser.add_argument("--env", choices=["prod", "demo"], default="prod", help="Execution environment for live orders (default: prod)")
+    parser.add_argument("--mode", choices=["paper", "live"], default="live", help="Execution mode: 'live' (places orders on Kalshi demo/prod API) or 'paper' (simulated locally)")
+    parser.add_argument("--env", choices=["demo", "prod"], default=KALSHI_ENV, help=f"Kalshi account API environment (default: {KALSHI_ENV})")
     parser.add_argument("--bankroll", type=float, default=BANKROLL_START, help="Initial bankroll for paper trading ($)")
     parser.add_argument("--max-hours", type=float, default=MAX_HOURS_TO_EXPIRY, help=f"Max hours to settlement (default: {MAX_HOURS_TO_EXPIRY})")
     parser.add_argument("--min-prob", type=float, default=MIN_PROBABILITY, help=f"Min probability (default: {MIN_PROBABILITY})")
@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Interval in seconds between cycles when looping (default: 300s)")
     args = parser.parse_args()
 
-    order_api_url = PROD_API_URL if args.env == "prod" else DEMO_API_URL
+    order_api_url = DEMO_API_URL if args.env == "demo" else PROD_API_URL
     scanner_api_url = PROD_API_URL  # Real-time liquid production orderbooks
 
     client = KalshiClient(base_url=order_api_url)
@@ -67,7 +67,7 @@ def main():
     )
 
     print("\n" + "="*80)
-    print(f" KALSHI HIGH-PROBABILITY TRADING BOT [{args.mode.upper()} MODE]")
+    print(f" KALSHI HIGH-PROBABILITY TRADING BOT [{args.mode.upper()} MODE - {args.env.upper()} API]")
     print(f" Strategy: {args.min_prob*100:.0f}%-{args.max_prob*100:.0f}% Win Chance, <{args.max_hours:.0f}h Expiry, Max {args.max_per_event} Bet/Event")
     print("="*80)
 
