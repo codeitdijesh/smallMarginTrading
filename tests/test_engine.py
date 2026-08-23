@@ -64,3 +64,178 @@ def test_bot_cycle_prevents_multiple_bets_on_same_event():
         # Run cycle again: should place 0 new trades since both events are already active
         second_cycle = bot.execute_scan_cycle()
         assert len(second_cycle) == 0
+
+def test_bot_active_monitoring_stop_loss_persistence():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        state_file = Path(tmp_dir) / "test_state.json"
+        risk_manager = RiskManager(
+            enable_stop_loss=True,
+            stop_loss_type="dynamic",
+            stop_loss_min_drop=0.15,
+            stop_loss_max_drop=0.35,
+            stop_loss_limit_floor=0.40,
+            stop_loss_persistence_ticks=2
+        )
+        bot = TradingBot(
+            mode="paper",
+            bankroll=1000.0,
+            risk_manager=risk_manager,
+            state_file=state_file
+        )
+
+        pos_key = "KXTEST-26AUG22_yes"
+        bot.active_positions[pos_key] = {
+            "ticker": "KXTEST-26AUG22",
+            "event_ticker": "KXTEST",
+            "side": "yes",
+            "entry_price": 0.90,
+            "contracts": 50,
+            "total_cost": 45.0,
+            "est_fee": 0.50,
+            "est_net_profit": 4.50,
+            "hours_left": 24.0,
+            "initial_hours": 24.0,
+            "breach_count": 0,
+            "target_stop": 0.55
+        }
+
+        # Mock quote: bid is 0.50 (< 0.55 stop), spread is 0.06, depth is 10
+        bot.client.get_market_quote = lambda ticker, side: {
+            "ticker": ticker,
+            "side": side,
+            "bid_price": 0.50,
+            "ask_price": 0.56,
+            "spread": 0.06,
+            "bid_depth": 10,
+            "status": "open",
+            "result": "",
+            "close_time": None
+        }
+
+        # Tick 1: First breach -> breach_count becomes 1, no exit yet (whipsaw filter)
+        stats1 = bot.monitor_active_positions()
+        assert stats1["warnings"] == 1
+        assert stats1["exits"] == 0
+        assert pos_key in bot.active_positions
+        assert bot.active_positions[pos_key]["breach_count"] == 1
+
+        # Tick 2: Second consecutive breach -> triggers stop loss!
+        stats2 = bot.monitor_active_positions()
+        assert stats2["exits"] == 1
+        assert pos_key not in bot.active_positions
+        assert len(bot.closed_positions) == 1
+        closed = bot.closed_positions[0]
+        assert closed["outcome"] == "STOP_LOSS"
+        assert closed["exit_price"] == 0.50
+
+def test_bot_active_monitoring_recovers_from_noise():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        state_file = Path(tmp_dir) / "test_state.json"
+        risk_manager = RiskManager(
+            enable_stop_loss=True,
+            stop_loss_persistence_ticks=2
+        )
+        bot = TradingBot(
+            mode="paper",
+            bankroll=1000.0,
+            risk_manager=risk_manager,
+            state_file=state_file
+        )
+
+        pos_key = "KXTEST-26AUG22_yes"
+        bot.active_positions[pos_key] = {
+            "ticker": "KXTEST-26AUG22",
+            "event_ticker": "KXTEST",
+            "side": "yes",
+            "entry_price": 0.90,
+            "contracts": 50,
+            "total_cost": 45.0,
+            "est_fee": 0.50,
+            "est_net_profit": 4.50,
+            "hours_left": 24.0,
+            "initial_hours": 24.0,
+            "breach_count": 0,
+            "target_stop": 0.55
+        }
+
+        # Tick 1: momentary dip to 0.50
+        bot.client.get_market_quote = lambda ticker, side: {
+            "ticker": ticker,
+            "side": side,
+            "bid_price": 0.50,
+            "ask_price": 0.56,
+            "spread": 0.06,
+            "bid_depth": 10,
+            "status": "open",
+            "result": "",
+            "close_time": None
+        }
+        bot.monitor_active_positions()
+        assert bot.active_positions[pos_key]["breach_count"] == 1
+
+        # Tick 2: price recovers back to 0.88 -> breach_count resets to 0!
+        bot.client.get_market_quote = lambda ticker, side: {
+            "ticker": ticker,
+            "side": side,
+            "bid_price": 0.88,
+            "ask_price": 0.92,
+            "spread": 0.04,
+            "bid_depth": 20,
+            "status": "open",
+            "result": "",
+            "close_time": None
+        }
+        stats2 = bot.monitor_active_positions()
+        assert stats2["exits"] == 0
+        assert pos_key in bot.active_positions
+        assert bot.active_positions[pos_key]["breach_count"] == 0
+
+def test_bot_startup_reconciliation_settled():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        state_file = Path(tmp_dir) / "test_state.json"
+        
+        # Write state file containing an unresolved position
+        initial_state = {
+            "mode": "paper",
+            "bankroll": 1000.0,
+            "initial_bankroll": 1000.0,
+            "active_positions": {
+                "KXWIN-26AUG22_yes": {
+                    "ticker": "KXWIN-26AUG22",
+                    "side": "yes",
+                    "entry_price": 0.90,
+                    "contracts": 50,
+                    "total_cost": 45.0,
+                    "est_fee": 0.50
+                }
+            },
+            "closed_positions": []
+        }
+        import json
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(initial_state, f)
+
+        bot = TradingBot(
+            mode="paper",
+            bankroll=1000.0,
+            state_file=state_file
+        )
+
+        # Mock quote showing the market finalized as "yes" while the bot was booting up
+        bot.client.get_market_quote = lambda ticker, side: {
+            "ticker": ticker,
+            "side": side,
+            "bid_price": 1.0,
+            "ask_price": 1.0,
+            "spread": 0.0,
+            "bid_depth": 0,
+            "status": "finalized",
+            "result": "yes",
+            "close_time": None
+        }
+
+        bot.reconcile_positions_on_startup()
+        assert len(bot.active_positions) == 0
+        assert len(bot.closed_positions) == 1
+        assert bot.closed_positions[0]["outcome"] == "WIN"
+

@@ -1,12 +1,19 @@
 """
-Trading Bot Engine (Paper & Live).
+Trading Bot Engine (Demo & Live API).
 Executes the high-probability, low-margin compounding strategy.
-Simulates paper trading portfolio or submits strict limit orders to Kalshi API.
+Features:
+- Active real-time position monitoring
+- Dynamic time-decay stop-loss execution
+- Multi-tick persistence filter (anti-whipsaw noise defense)
+- Bid depth and spread sanity filters (anti-ghost bid defense)
+- Limit floor rule (anti-penny panic dump defense)
+- Automatic startup reconciliation and state recovery
 """
 
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 import json
+import time
 from pathlib import Path
 
 from config.settings import (
@@ -14,6 +21,17 @@ from config.settings import (
     MAX_POSITION_SIZE_PERCENT,
     MAX_TOTAL_EXPOSURE_PERCENT,
     STOP_LOSS_PRICE_DROP,
+    ENABLE_STOP_LOSS,
+    STOP_LOSS_TYPE,
+    STOP_LOSS_BASE_DROP,
+    STOP_LOSS_MIN_DROP,
+    STOP_LOSS_MAX_DROP,
+    STOP_LOSS_LIMIT_FLOOR,
+    STOP_LOSS_PERSISTENCE_TICKS,
+    STOP_LOSS_MAX_SPREAD,
+    STOP_LOSS_MIN_BID_DEPTH,
+    POSITION_CHECK_INTERVAL,
+    SCAN_INTERVAL,
     BASE_DIR
 )
 from src.strategy.scanner import MarketScanner
@@ -25,7 +43,7 @@ from src.utils.logger import logger
 class TradingBot:
     def __init__(
         self,
-        mode: str = "paper", # "paper" or "live"
+        mode: str = "live", # "live" (Demo or Prod via KalshiClient) or "paper"
         bankroll: float = BANKROLL_START,
         scanner: Optional[MarketScanner] = None,
         risk_manager: Optional[RiskManager] = None,
@@ -38,7 +56,16 @@ class TradingBot:
         self.risk_manager = risk_manager or RiskManager(
             max_position_pct=MAX_POSITION_SIZE_PERCENT,
             max_exposure_pct=MAX_TOTAL_EXPOSURE_PERCENT,
-            stop_loss_drop=STOP_LOSS_PRICE_DROP
+            stop_loss_drop=STOP_LOSS_PRICE_DROP,
+            enable_stop_loss=ENABLE_STOP_LOSS,
+            stop_loss_type=STOP_LOSS_TYPE,
+            stop_loss_base_drop=STOP_LOSS_BASE_DROP,
+            stop_loss_min_drop=STOP_LOSS_MIN_DROP,
+            stop_loss_max_drop=STOP_LOSS_MAX_DROP,
+            stop_loss_limit_floor=STOP_LOSS_LIMIT_FLOOR,
+            stop_loss_persistence_ticks=STOP_LOSS_PERSISTENCE_TICKS,
+            stop_loss_max_spread=STOP_LOSS_MAX_SPREAD,
+            stop_loss_min_bid_depth=STOP_LOSS_MIN_BID_DEPTH
         )
         self.state_file = state_file or (BASE_DIR / f"{self.mode}_trading_state.json")
         self.active_positions: Dict[str, Dict[str, Any]] = {}
@@ -60,6 +87,9 @@ class TradingBot:
         self.bankroll = bankroll
         self.initial_bankroll = bankroll
         self.load_state()
+
+        # Reconcile on startup to handle any trades resolved during offline periods
+        self.reconcile_positions_on_startup()
 
     @property
     def total_exposure(self) -> float:
@@ -90,19 +120,22 @@ class TradingBot:
                     if pos_key not in self.active_positions:
                         event_ticker = ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
                         series_ticker = ticker.split("-")[0] if "-" in ticker else ticker
+                        entry_price = float(mp.get("market_exposure", 0)) / max(1, abs(pos_count)) if abs(pos_count) > 0 else 0.90
                         self.active_positions[pos_key] = {
                             "ticker": ticker,
                             "event_ticker": event_ticker,
                             "series_ticker": series_ticker,
                             "title": ticker,
                             "side": side,
-                            "entry_price": float(mp.get("market_exposure", 0)) / max(1, abs(pos_count)),
+                            "entry_price": round(entry_price, 4),
                             "contracts": abs(pos_count),
                             "total_cost": float(mp.get("market_exposure", 0)),
                             "est_fee": 0.0,
                             "est_net_profit": 0.0,
                             "roi_percent": 0.0,
-                            "hours_left": 0.0,
+                            "hours_left": 24.0,
+                            "initial_hours": 24.0,
+                            "breach_count": 0,
                             "close_time": "Live Position",
                             "mode": "live",
                             "synced_from_api": True,
@@ -111,13 +144,212 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Could not sync live positions from API: {e}")
 
+    def reconcile_positions_on_startup(self):
+        """
+        Reconciles portfolio state on startup.
+        Checks if any active positions were settled or resolved while the bot was offline.
+        """
+        if not self.active_positions:
+            return
+
+        logger.info(f"Reconciling {len(self.active_positions)} active position(s) on startup...")
+        resolved_keys = []
+        now = datetime.now(timezone.utc)
+
+        for pos_key, pos in list(self.active_positions.items()):
+            ticker = pos["ticker"]
+            side = pos["side"]
+            quote = self.client.get_market_quote(ticker, side)
+
+            if not quote:
+                continue
+
+            status = quote.get("status", "").lower()
+            result = quote.get("result", "").lower()
+
+            if status in ("finalized", "closed", "settled") or result in ("yes", "no"):
+                # Market finalized while offline
+                if result == side:
+                    gross_payout = pos["contracts"] * 1.0
+                    fee = pos.get("est_fee", 0.0)
+                    realized_pnl = gross_payout - pos["total_cost"] - fee
+                    pos["outcome"] = "WIN"
+                    pos["realized_pnl"] = round(realized_pnl, 2)
+                    if not (self.mode == "live" and self.live_balance_loaded):
+                        self.bankroll += (gross_payout - fee)
+                    logger.info(f"[RECONCILE WIN] {ticker} ({side.upper()}) resolved as WIN while offline. Realized: +${realized_pnl:.2f}")
+                else:
+                    realized_pnl = -pos["total_cost"]
+                    pos["outcome"] = "LOSS"
+                    pos["realized_pnl"] = round(realized_pnl, 2)
+                    logger.warning(f"[RECONCILE LOSS] {ticker} ({side.upper()}) resolved as LOSS while offline. Realized: ${realized_pnl:.2f}")
+
+                pos["resolved_at"] = now.isoformat()
+                self.closed_positions.append(pos)
+                resolved_keys.append(pos_key)
+
+        for k in resolved_keys:
+            if k in self.active_positions:
+                del self.active_positions[k]
+
+        if resolved_keys:
+            self.save_state()
+            logger.info(f"Reconciliation complete: {len(resolved_keys)} position(s) settled.")
+
+    def monitor_active_positions(self) -> Dict[str, Any]:
+        """
+        Active real-time monitoring loop for all open positions:
+        1. Checks for market resolution / final settlement.
+        2. Evaluates dynamic stop-loss condition (time-decay adjusted, spread/depth filtered).
+        3. Applies multi-tick persistence filter to eliminate whipsaws.
+        4. Submits sell limit order to Kalshi API when hard stop conditions are satisfied.
+        """
+        if not self.active_positions:
+            return {"active_count": 0, "exits": 0, "warnings": 0, "settled": 0}
+
+        now = datetime.now(timezone.utc)
+        resolved_keys = []
+        stats = {"active_count": len(self.active_positions), "exits": 0, "warnings": 0, "settled": 0}
+
+        for pos_key, pos in list(self.active_positions.items()):
+            ticker = pos["ticker"]
+            side = pos["side"]
+            entry_price = pos["entry_price"]
+            contracts = pos["contracts"]
+            total_cost = pos["total_cost"]
+
+            quote = self.client.get_market_quote(ticker, side)
+            if not quote:
+                continue
+
+            status = quote.get("status", "").lower()
+            result = quote.get("result", "").lower()
+
+            # 1. Check for Market Resolution
+            if status in ("finalized", "closed", "settled") or result in ("yes", "no"):
+                if result == side:
+                    gross_payout = contracts * 1.0
+                    fee = pos.get("est_fee", 0.0)
+                    realized_pnl = gross_payout - total_cost - fee
+                    pos["outcome"] = "WIN"
+                    pos["realized_pnl"] = round(realized_pnl, 2)
+                    if not (self.mode == "live" and self.live_balance_loaded):
+                        self.bankroll += (gross_payout - fee)
+                    logger.info(f"[SETTLEMENT WIN] {ticker} ({side.upper()}) resolved as WIN! Realized PnL: +${realized_pnl:.2f}")
+                else:
+                    realized_pnl = -total_cost
+                    pos["outcome"] = "LOSS"
+                    pos["realized_pnl"] = round(realized_pnl, 2)
+                    logger.warning(f"[SETTLEMENT LOSS] {ticker} ({side.upper()}) resolved as LOSS. Realized PnL: ${realized_pnl:.2f}")
+
+                pos["resolved_at"] = now.isoformat()
+                self.closed_positions.append(pos)
+                resolved_keys.append(pos_key)
+                stats["settled"] += 1
+                continue
+
+            # 2. Evaluate Dynamic Stop-Loss
+            bid_price = quote["bid_price"]
+            ask_price = quote["ask_price"]
+            bid_depth = quote["bid_depth"]
+
+            # Calculate remaining hours
+            hours_left = pos.get("hours_left", 24.0)
+            if quote.get("close_time"):
+                try:
+                    close_dt = datetime.fromisoformat(quote["close_time"].replace("Z", "+00:00"))
+                    hours_left = max(0.0, (close_dt - now).total_seconds() / 3600.0)
+                except Exception:
+                    pass
+
+            initial_hours = pos.get("initial_hours") or pos.get("hours_left") or 24.0
+            pos["hours_left"] = round(hours_left, 2)
+            pos["last_bid"] = bid_price
+
+            should_exit, target_stop, reason = self.risk_manager.evaluate_stop_loss_condition(
+                entry_price=entry_price,
+                current_bid=bid_price,
+                current_ask=ask_price,
+                bid_depth=bid_depth,
+                hours_left=hours_left,
+                total_hours=initial_hours
+            )
+
+            pos["target_stop"] = target_stop
+
+            if should_exit:
+                pos["breach_count"] = pos.get("breach_count", 0) + 1
+                stats["warnings"] += 1
+                logger.warning(
+                    f"[STOP LOSS WARNING] {ticker} ({side.upper()}) | Entry: ${entry_price:.2f} | Bid: ${bid_price:.2f} <= Dynamic Stop: ${target_stop:.2f} "
+                    f"| Breach: {pos['breach_count']}/{self.risk_manager.stop_loss_persistence_ticks} | {reason}"
+                )
+
+                # 3. Check Multi-Tick Persistence Filter
+                if pos["breach_count"] >= self.risk_manager.stop_loss_persistence_ticks:
+                    logger.warning(f"[STOP LOSS TRIGGERED] Breach persisted for {pos['breach_count']} ticks. Executing sell exit for {ticker} ({side.upper()}) @ ${bid_price:.2f}...")
+
+                    # Execute Live Limit Sell on Kalshi
+                    order_response = None
+                    if self.mode == "live" and self.client.is_authenticated:
+                        order_response = self.client.place_limit_order(
+                            ticker=ticker,
+                            action="sell",
+                            side=side,
+                            count=contracts,
+                            price_dollars=bid_price
+                        )
+                        if not order_response:
+                            logger.error(f"Failed to place live stop-loss sell order for {ticker}. Retrying next cycle.")
+                            continue
+
+                    # Calculate Realized Loss with Exit Fee
+                    exit_proceeds = round(bid_price * contracts, 2)
+                    econ = calculate_contract_economics(bid_price)
+                    exit_fee = round(econ["fee"] * contracts, 3)
+                    realized_pnl = round(exit_proceeds - total_cost - exit_fee, 2)
+
+                    if not (self.mode == "live" and self.live_balance_loaded):
+                        self.bankroll += (exit_proceeds - exit_fee)
+
+                    pos["outcome"] = "STOP_LOSS"
+                    pos["exit_price"] = bid_price
+                    pos["exit_proceeds"] = exit_proceeds
+                    pos["exit_fee"] = exit_fee
+                    pos["realized_pnl"] = realized_pnl
+                    pos["resolved_at"] = now.isoformat()
+                    pos["exit_order_id"] = order_response.get("order_id") if order_response else None
+
+                    self.closed_positions.append(pos)
+                    resolved_keys.append(pos_key)
+                    stats["exits"] += 1
+                    logger.warning(
+                        f"[STOP LOSS EXECUTED] Closed {contracts}x {ticker} ({side.upper()}) @ ${bid_price:.2f}. "
+                        f"Proceeds: ${exit_proceeds:.2f}, Fee: ${exit_fee:.2f}, Realized Loss: -${abs(realized_pnl):.2f} "
+                        f"(Saved: +${total_cost - exit_proceeds:.2f} vs total loss)"
+                    )
+            else:
+                # Price recovered or noise check failed - reset breach counter
+                if pos.get("breach_count", 0) > 0:
+                    logger.info(f"[STOP LOSS RECOVERED] {ticker} ({side.upper()}) bid recovered to ${bid_price:.2f} > ${target_stop:.2f}. Persistence filter reset.")
+                    pos["breach_count"] = 0
+
+        for k in resolved_keys:
+            if k in self.active_positions:
+                del self.active_positions[k]
+
+        if resolved_keys or stats["warnings"] > 0:
+            self.save_state()
+
+        return stats
+
     def execute_scan_cycle(self) -> List[Dict[str, Any]]:
         """
-        Executes one full scan & trade cycle:
+        Executes one full scan & trade entry cycle:
         1. Query live balance and sync positions if in live mode
         2. Scan opportunities (with native time windowing and event-level deduplication)
         3. Validate against strict risk controls (5% position size, 1 position/5% per event, 75% max exposure)
-        4. Enter orders (paper simulated or live API limit order)
+        4. Enter orders (Demo/Live API limit order)
         """
         if self.mode == "live" and self.client.is_authenticated:
             live_bal = self.client.get_balance()
@@ -125,7 +357,7 @@ class TradingBot:
                 self.bankroll = live_bal["balance_dollars"]
             self.sync_live_positions()
 
-        logger.info(f"--- Starting {self.mode.upper()} Cycle | Bankroll: ${self.bankroll:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")
+        logger.info(f"--- Starting {self.mode.upper()} Scan Cycle | Bankroll: ${self.bankroll:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")
         opportunities = self.scanner.scan_all_opportunities(dedup_by_event=True)
 
         entered_trades = []
@@ -144,7 +376,7 @@ class TradingBot:
 
             total_cost = round(contracts * price, 2)
 
-            # Comprehensive multi-layer risk validation (ticker deduplication, event limit, series limit, portfolio ceiling)
+            # Multi-layer risk validation
             approved, reason = self.risk_manager.validate_candidate_trade(
                 self.bankroll,
                 self.active_positions,
@@ -175,6 +407,7 @@ class TradingBot:
 
             # Record Position
             econ = calculate_contract_economics(price)
+            hours_left = opp.get("hours_left", 24.0)
             pos = {
                 "ticker": ticker,
                 "event_ticker": event_ticker,
@@ -187,7 +420,10 @@ class TradingBot:
                 "est_fee": round(econ["fee"] * contracts, 3),
                 "est_net_profit": round(econ["net_profit"] * contracts, 3),
                 "roi_percent": opp["roi_percent"],
-                "hours_left": opp["hours_left"],
+                "hours_left": hours_left,
+                "initial_hours": hours_left,
+                "breach_count": 0,
+                "target_stop": self.risk_manager.calculate_dynamic_stop_price(price, hours_left, hours_left),
                 "close_time": opp["close_time"],
                 "mode": self.mode,
                 "order_id": order_response.get("order_id") if order_response else None,
@@ -198,36 +434,15 @@ class TradingBot:
             entered_trades.append(pos)
             logger.info(
                 f"[{self.mode.upper()} ORDER PLACED] {ticker} ({event_ticker}) -> {opp['action']} | {contracts} contracts @ ${price:.2f} "
-                f"(Cost: ${total_cost:.2f}, Est Net: +${pos['est_net_profit']:.2f})"
+                f"(Cost: ${total_cost:.2f}, Est Net: +${pos['est_net_profit']:.2f}, Dynamic Stop: ${pos['target_stop']:.2f})"
             )
 
         self.save_state()
         return entered_trades
 
     def evaluate_settlements(self, current_market_prices: Optional[Dict[str, float]] = None):
-        """
-        Simulates / updates position resolutions and stop loss exits.
-        """
-        now = datetime.now(timezone.utc)
-        resolved_keys = []
-
-        for key, pos in self.active_positions.items():
-            if current_market_prices and pos["ticker"] in current_market_prices:
-                cur_price = current_market_prices[pos["ticker"]]
-                if self.risk_manager.check_stop_loss(pos["entry_price"], cur_price):
-                    loss = pos["total_cost"] - (cur_price * pos["contracts"])
-                    self.bankroll -= loss
-                    pos["outcome"] = "STOP_LOSS"
-                    pos["realized_pnl"] = -round(loss, 2)
-                    pos["resolved_at"] = now.isoformat()
-                    self.closed_positions.append(pos)
-                    resolved_keys.append(key)
-                    logger.warning(f"[STOP LOSS EXIT] {pos['ticker']} exit @ ${cur_price:.2f}. Loss: -${loss:.2f}")
-
-        for key in resolved_keys:
-            del self.active_positions[key]
-
-        self.save_state()
+        """Bridge method maintaining backwards compatibility."""
+        return self.monitor_active_positions()
 
     def get_summary(self) -> Dict[str, Any]:
         """Returns portfolio performance metrics."""
@@ -275,3 +490,4 @@ class TradingBot:
                     logger.info(f"Loaded existing trading state from {self.state_file}")
             except Exception as e:
                 logger.error(f"Error loading state from {self.state_file}: {e}")
+

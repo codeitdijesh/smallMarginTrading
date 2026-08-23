@@ -62,7 +62,20 @@ MAX_POSITIONS_PER_EVENT = int(os.getenv("MAX_POSITIONS_PER_EVENT", "1"))        
 MAX_EVENT_EXPOSURE_PERCENT = float(os.getenv("MAX_EVENT_EXPOSURE_PERCENT", "0.05"))# Max 5% bankroll exposure on any single event
 MAX_POSITIONS_PER_SERIES = int(os.getenv("MAX_POSITIONS_PER_SERIES", "3"))         # Max 3 trades across the same series
 MAX_SERIES_EXPOSURE_PERCENT = float(os.getenv("MAX_SERIES_EXPOSURE_PERCENT", "0.15")) # Max 15% exposure in one series
-STOP_LOSS_PRICE_DROP = 0.15                                           # Exit if contract price drops > 15 cents below entry
+
+# Enhanced Stop-Loss & Risk Defense Parameters
+ENABLE_STOP_LOSS = os.getenv("ENABLE_STOP_LOSS", "true").lower() in ("true", "1", "yes")
+STOP_LOSS_TYPE = os.getenv("STOP_LOSS_TYPE", "dynamic").lower()       # "dynamic" (time-decay adjusted) or "static"
+STOP_LOSS_PRICE_DROP = float(os.getenv("STOP_LOSS_PRICE_DROP", "0.25")) # Base stop drop (e.g. 0.25 drop -> 90c entry stops at 65c)
+STOP_LOSS_BASE_DROP = STOP_LOSS_PRICE_DROP
+STOP_LOSS_MIN_DROP = float(os.getenv("STOP_LOSS_MIN_DROP", "0.15"))   # Tighter drop tolerance close to expiry (e.g. 90c -> 75c)
+STOP_LOSS_MAX_DROP = float(os.getenv("STOP_LOSS_MAX_DROP", "0.35"))   # Wider drop tolerance when 18-24h remain (e.g. 90c -> 55c)
+STOP_LOSS_LIMIT_FLOOR = float(os.getenv("STOP_LOSS_LIMIT_FLOOR", "0.40")) # Hard floor: never panic-sell into pennies (< 40c)
+STOP_LOSS_PERSISTENCE_TICKS = int(os.getenv("STOP_LOSS_PERSISTENCE_TICKS", "2")) # Consecutive checks breach must persist (noise filter)
+STOP_LOSS_MAX_SPREAD = float(os.getenv("STOP_LOSS_MAX_SPREAD", "0.15"))# Ignore illiquid/ghost bids if spread > 15c
+STOP_LOSS_MIN_BID_DEPTH = int(os.getenv("STOP_LOSS_MIN_BID_DEPTH", "5")) # Min contracts at top bid to qualify as real liquidity
+POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", "15")) # Seconds between active position monitor checks
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))                 # Seconds between new opportunity scans (3 min)
 
 # 5. Kalshi Fee Model Parameters
 KALSHI_FEE_MULTIPLIER = 0.07                                          # Kalshi formula: 0.07 * price * (1 - price)

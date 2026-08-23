@@ -13,7 +13,16 @@ from config.settings import (
     MAX_EVENT_EXPOSURE_PERCENT,
     MAX_POSITIONS_PER_SERIES,
     MAX_SERIES_EXPOSURE_PERCENT,
-    STOP_LOSS_PRICE_DROP
+    STOP_LOSS_PRICE_DROP,
+    ENABLE_STOP_LOSS,
+    STOP_LOSS_TYPE,
+    STOP_LOSS_BASE_DROP,
+    STOP_LOSS_MIN_DROP,
+    STOP_LOSS_MAX_DROP,
+    STOP_LOSS_LIMIT_FLOOR,
+    STOP_LOSS_PERSISTENCE_TICKS,
+    STOP_LOSS_MAX_SPREAD,
+    STOP_LOSS_MIN_BID_DEPTH
 )
 
 class RiskManager:
@@ -25,7 +34,16 @@ class RiskManager:
         max_event_exposure_pct: float = MAX_EVENT_EXPOSURE_PERCENT,
         max_positions_per_series: int = MAX_POSITIONS_PER_SERIES,
         max_series_exposure_pct: float = MAX_SERIES_EXPOSURE_PERCENT,
-        stop_loss_drop: float = STOP_LOSS_PRICE_DROP
+        stop_loss_drop: float = STOP_LOSS_PRICE_DROP,
+        enable_stop_loss: bool = ENABLE_STOP_LOSS,
+        stop_loss_type: str = STOP_LOSS_TYPE,
+        stop_loss_base_drop: float = STOP_LOSS_BASE_DROP,
+        stop_loss_min_drop: float = STOP_LOSS_MIN_DROP,
+        stop_loss_max_drop: float = STOP_LOSS_MAX_DROP,
+        stop_loss_limit_floor: float = STOP_LOSS_LIMIT_FLOOR,
+        stop_loss_persistence_ticks: int = STOP_LOSS_PERSISTENCE_TICKS,
+        stop_loss_max_spread: float = STOP_LOSS_MAX_SPREAD,
+        stop_loss_min_bid_depth: int = STOP_LOSS_MIN_BID_DEPTH
     ):
         self.max_position_pct = max_position_pct
         self.max_exposure_pct = max_exposure_pct
@@ -34,6 +52,15 @@ class RiskManager:
         self.max_positions_per_series = max_positions_per_series
         self.max_series_exposure_pct = max_series_exposure_pct
         self.stop_loss_drop = stop_loss_drop
+        self.enable_stop_loss = enable_stop_loss
+        self.stop_loss_type = stop_loss_type.lower()
+        self.stop_loss_base_drop = stop_loss_base_drop
+        self.stop_loss_min_drop = stop_loss_min_drop
+        self.stop_loss_max_drop = stop_loss_max_drop
+        self.stop_loss_limit_floor = stop_loss_limit_floor
+        self.stop_loss_persistence_ticks = stop_loss_persistence_ticks
+        self.stop_loss_max_spread = stop_loss_max_spread
+        self.stop_loss_min_bid_depth = stop_loss_min_bid_depth
 
     def calculate_position_size(self, current_bankroll: float, contract_price: float) -> int:
         """
@@ -140,11 +167,89 @@ class RiskManager:
             )
         return True, "Approved"
 
+    def calculate_dynamic_stop_price(self, entry_price: float, hours_left: float, total_hours: float = 24.0) -> float:
+        """
+        Calculates the stop-loss price threshold for a position.
+        If 'dynamic', adjusts threshold based on time remaining until settlement:
+          - High time left (e.g. 18-24h): Wider buffer (allows normal intraday mean-reversion, e.g. down to 55c).
+          - Low time left (e.g. <2h): Tighter buffer (cuts loss rapidly before expiry, e.g. down to 75c).
+        Guaranteed to never go below stop_loss_limit_floor (e.g. 40c).
+        """
+        if not self.enable_stop_loss:
+            return 0.0
+
+        if self.stop_loss_type == "static":
+            stop_price = entry_price - self.stop_loss_base_drop
+        else: # "dynamic"
+            # Time factor between 0.0 and 1.0 (with square root damping for natural decay curve)
+            time_factor = max(0.0, min(1.0, hours_left / max(1.0, total_hours)))
+            drop = self.stop_loss_min_drop + (self.stop_loss_max_drop - self.stop_loss_min_drop) * (time_factor ** 0.5)
+            stop_price = entry_price - drop
+
+        # Apply limit floor
+        return max(self.stop_loss_limit_floor, round(stop_price, 2))
+
+    def evaluate_stop_loss_condition(
+        self,
+        entry_price: float,
+        current_bid: float,
+        current_ask: float,
+        bid_depth: int,
+        hours_left: float,
+        total_hours: float = 24.0
+    ) -> Tuple[bool, float, str]:
+        """
+        Evaluates whether a position breach meets all sanity checks:
+        1. Checks if stop loss is enabled
+        2. Checks limit floor: avoids panic dumping at 5-10c pennies
+        3. Checks spread sanity: avoids exiting when bid is artificially depressed due to wide spread
+        4. Checks bid depth: avoids exiting into a single 1-contract phantom bid
+        5. Compares current_bid with target dynamic stop price
+        """
+        if not self.enable_stop_loss:
+            return False, 0.0, "Stop loss disabled in configuration."
+
+        target_stop = self.calculate_dynamic_stop_price(entry_price, hours_left, total_hours)
+
+        if current_bid <= 0:
+            return False, target_stop, "Zero bid / No liquidity in orderbook."
+
+        # Filter 1: Limit Floor (prevent selling at 5-10 cents)
+        if current_bid < self.stop_loss_limit_floor:
+            return False, target_stop, (
+                f"Bid ${current_bid:.2f} is below limit floor ${self.stop_loss_limit_floor:.2f} "
+                f"(refusing to panic-dump at pennies; preserving recovery optionality)"
+            )
+
+        # Filter 2: Spread Sanity (detect ghost / illiquid spreads)
+        if current_ask > 0:
+            spread = current_ask - current_bid
+            if spread > self.stop_loss_max_spread:
+                return False, target_stop, (
+                    f"Spread ${spread:.2f} exceeds max allowable spread (${self.stop_loss_max_spread:.2f}); "
+                    f"ignoring temporary orderbook illiquidity"
+                )
+
+        # Filter 3: Bid Depth Sanity (ensure real volume exists at bid)
+        if bid_depth < self.stop_loss_min_bid_depth:
+            return False, target_stop, (
+                f"Bid depth ({bid_depth} contracts) < minimum required depth ({self.stop_loss_min_bid_depth}); "
+                f"ignoring single-contract flash dip"
+            )
+
+        # Filter 4: Trigger comparison
+        if current_bid <= target_stop:
+            return True, target_stop, f"Bid ${current_bid:.2f} <= dynamic stop threshold ${target_stop:.2f}"
+
+        return False, target_stop, f"Bid ${current_bid:.2f} > dynamic stop threshold ${target_stop:.2f}"
+
     def check_stop_loss(self, entry_price: float, current_market_price: float) -> bool:
         """
         Returns True if current price has dropped by more than the stop loss threshold.
+        (Maintained for legacy/simple checks).
         """
         if current_market_price <= 0:
             return True
         price_drop = entry_price - current_market_price
         return price_drop >= self.stop_loss_drop
+

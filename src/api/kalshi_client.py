@@ -148,6 +148,54 @@ class KalshiClient:
             return resp.json().get("orderbook")
         return None
 
+    def get_market_quote(self, ticker: str, side: str = "yes") -> Optional[Dict[str, Any]]:
+        """
+        Retrieves real-time bid, ask, spread, depth, and status for a specific market ticker and side.
+        """
+        market = self.get_market(ticker)
+        if not market:
+            return None
+
+        side_lower = side.lower()
+        if side_lower == "yes":
+            bid = float(market.get("yes_bid_dollars") or market.get("yes_bid") or 0)
+            ask = float(market.get("yes_ask_dollars") or market.get("yes_ask") or 0)
+        else:
+            bid = float(market.get("no_bid_dollars") or market.get("no_bid") or 0)
+            ask = float(market.get("no_ask_dollars") or market.get("no_ask") or 0)
+
+        # Retrieve orderbook depth if available
+        depth = 0
+        try:
+            ob = self.get_orderbook(ticker)
+            if ob:
+                levels = ob.get("yes" if side_lower == "yes" else "no", [])
+                if levels and isinstance(levels, list):
+                    top_level = levels[0] if len(levels) > 0 else None
+                    if top_level and isinstance(top_level, (list, tuple)) and len(top_level) >= 2:
+                        depth = int(float(top_level[1]))
+                    elif top_level and isinstance(top_level, dict):
+                        depth = int(float(top_level.get("count") or top_level.get("size") or 0))
+        except Exception:
+            depth = 0
+
+        # Fallback depth estimation if orderbook is simple
+        if depth == 0 and bid > 0:
+            depth = int(float(market.get("open_interest_fp") or market.get("open_interest") or 10))
+
+        return {
+            "ticker": ticker,
+            "side": side_lower,
+            "bid_price": round(bid, 4),
+            "ask_price": round(ask, 4),
+            "spread": round(max(0.0, ask - bid), 4),
+            "bid_depth": depth,
+            "status": market.get("status", "open"),
+            "result": market.get("result", "").lower(),
+            "close_time": market.get("close_time") or market.get("expiration_time"),
+            "raw_market": market
+        }
+
     # Authenticated Portfolio & Order Management
     def get_balance(self) -> Optional[Dict[str, Any]]:
         """Retrieves account balance and available cash."""

@@ -81,45 +81,38 @@ KALSHI_ENV=demo # or prod
 
 ---
 
-## 4. Usage
+## 4. Usage & 24/7 Server Execution
 
-### Scan Live Opportunities (<24h, >90% Prob)
+### Run 24/7 Dedicated Server Daemon (Recommended)
 
-```bash
-# Scan with top 10 displayed
-python main.py scan --top 10
-```
-
-### Run Trading Bot
+Run the bot as a continuous background daemon on your server or dedicated laptop:
 
 ```bash
-# Place actual live/demo orders:
-python main.py bot --mode live
+# Windows Batch (Auto-Restarts if closed or on error)
+.\scripts\run_bot_daemon.bat
 
-# Run in paper simulation mode:
-python main.py bot --mode paper
+# Or PowerShell
+.\scripts\run_bot_daemon.ps1
 
-# Run continuously in a loop (e.g. every 5 minutes):
-python main.py bot --mode live --loop --interval 300
+# Or Direct Python CLI
+python scripts/run_bot.py --mode live --env demo --poll-interval 15 --scan-interval 180
 ```
+
+### Strategy & 4-Layer Stop-Loss Defense
+1. **Dynamic Time-Decay Stop:**
+   - Adapts buffer based on hours to settlement ($24\text{h} \to \$0.55\text{ stop}, 1\text{h} \to \$0.75\text{ stop}$).
+2. **Multi-Tick Persistence Filter:**
+   - Price must stay below threshold for 2 consecutive ticks (30s) to avoid whipsaws / momentary flash dips.
+3. **Spread & Depth Sanity:**
+   - Ignores artificial spreads ($> \$0.15$) and 1-contract phantom bids.
+4. **Limit Floor Protection:**
+   - Hard floor at \$0.40 prevents panic dumping into illiquid pennies ($<\$0.40$).
+5. **Startup Auto-Reconciliation:**
+   - If server reboots or is offline, the bot automatically checks settled positions and reconciles balances upon startup.
 
 ---
 
-## 5. GitHub Actions Deployment
-
-### How Often to Run?
-- **Schedule: Every 1 hour (`0 * * * *`)**
-- **Rationale:** Automatically checks and enters qualified same-day intraday positions every hour without excessive API or runner utilization. Manual execution is also supported anytime via GitHub UI's **Run workflow** button.
-
-### Setting Up GitHub Repository Secrets
-Under your GitHub repo: **Settings -> Secrets and variables -> Actions**, add:
-1. `KALSHI_API_KEY_ID`: Your Kalshi Key ID UUID (e.g., `ced75553-...`)
-2. `KALSHI_PRIVATE_KEY`: Your full RSA Private Key text (including `-----BEGIN RSA PRIVATE KEY-----` and `-----END RSA PRIVATE KEY-----`)
-3. `KALSHI_ENV`: `demo` (for testing) or `prod` (for live trading)
-
----
-
-## 6. Running Tests
+## 5. Running Tests
 
 ```bash
 python -m pytest

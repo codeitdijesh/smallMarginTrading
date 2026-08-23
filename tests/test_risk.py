@@ -95,3 +95,82 @@ def test_validate_candidate_trade_allows_different_events():
     approved, reason = risk.validate_candidate_trade(bankroll, active_positions, candidate, 49.0)
     assert approved is True
     assert reason == "Approved"
+
+def test_dynamic_stop_loss_time_decay():
+    risk = RiskManager(
+        enable_stop_loss=True,
+        stop_loss_type="dynamic",
+        stop_loss_min_drop=0.15,
+        stop_loss_max_drop=0.35,
+        stop_loss_limit_floor=0.40
+    )
+    entry_price = 0.90
+
+    # 24h left -> maximum drop allowance (0.35 drop -> stop at 0.55)
+    stop_24h = risk.calculate_dynamic_stop_price(entry_price, hours_left=24.0, total_hours=24.0)
+    assert stop_24h == 0.55
+
+    # 0h left (at expiry) -> minimum drop allowance (0.15 drop -> stop at 0.75)
+    stop_0h = risk.calculate_dynamic_stop_price(entry_price, hours_left=0.0, total_hours=24.0)
+    assert stop_0h == 0.75
+
+    # 6h left -> intermediate drop
+    stop_6h = risk.calculate_dynamic_stop_price(entry_price, hours_left=6.0, total_hours=24.0)
+    assert 0.55 < stop_6h < 0.75
+
+def test_stop_loss_evaluation_filters():
+    risk = RiskManager(
+        enable_stop_loss=True,
+        stop_loss_type="dynamic",
+        stop_loss_min_drop=0.15,
+        stop_loss_max_drop=0.35,
+        stop_loss_limit_floor=0.40,
+        stop_loss_max_spread=0.15,
+        stop_loss_min_bid_depth=5
+    )
+    entry_price = 0.90
+
+    # 1. Valid breach: 24h left (stop is 0.55), bid is 0.50, ask is 0.58 (spread 0.08 <= 0.15), depth 10 >= 5
+    should_exit, target_stop, reason = risk.evaluate_stop_loss_condition(
+        entry_price=entry_price,
+        current_bid=0.50,
+        current_ask=0.58,
+        bid_depth=10,
+        hours_left=24.0
+    )
+    assert should_exit is True
+    assert target_stop == 0.55
+
+    # 2. Limit Floor filter: Bid dropped to 0.20 (< 0.40 floor) -> DO NOT panic dump
+    should_exit, target_stop, reason = risk.evaluate_stop_loss_condition(
+        entry_price=entry_price,
+        current_bid=0.20,
+        current_ask=0.25,
+        bid_depth=10,
+        hours_left=24.0
+    )
+    assert should_exit is False
+    assert "below limit floor" in reason
+
+    # 3. Spread filter: Bid is 0.50, but Ask is 0.85 (spread 0.35 > 0.15) -> Illiquid spread, ignore
+    should_exit, target_stop, reason = risk.evaluate_stop_loss_condition(
+        entry_price=entry_price,
+        current_bid=0.50,
+        current_ask=0.85,
+        bid_depth=10,
+        hours_left=24.0
+    )
+    assert should_exit is False
+    assert "exceeds max allowable spread" in reason
+
+    # 4. Bid Depth filter: Bid is 0.50, but depth is only 1 contract (< 5 min) -> Ghost bid, ignore
+    should_exit, target_stop, reason = risk.evaluate_stop_loss_condition(
+        entry_price=entry_price,
+        current_bid=0.50,
+        current_ask=0.56,
+        bid_depth=1,
+        hours_left=24.0
+    )
+    assert should_exit is False
+    assert "Bid depth" in reason and "minimum required depth" in reason
+
