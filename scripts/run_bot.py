@@ -127,16 +127,17 @@ def main():
                     summary = bot.get_summary()
 
                     print(f"\n--- PORTFOLIO SUMMARY ({args.mode.upper()} - {args.env.upper()}) [{datetime.now().strftime('%H:%M:%S')}] ---")
-                    print(f" Current Bankroll: ${summary['current_bankroll']:.2f} (Start: ${summary['initial_bankroll']:.2f})")
-                    print(f" Available Cash:   ${summary['available_cash']:.2f}")
-                    print(f" Active Exposure:  ${summary['active_exposure']:.2f} across {summary['active_positions_count']} open position(s)")
-                    print(f" Closed Trades:    {summary['closed_trades_count']} | Realized PnL: ${summary['total_pnl']:.2f} (ROI: {summary['roi_percent']}%)")
-                    print(f" New Trades Entered This Scan: {len(trades)}")
+                    print(f" Total Account Equity: ${summary['total_equity']:.2f} (Initial: ${summary['initial_bankroll']:.2f})")
+                    print(f" Available Cash:       ${summary['available_cash']:.2f}")
+                    print(f" Active Exposure:      ${summary['active_exposure']:.2f} across {summary['active_positions_count']} open position(s)")
+                    print(f" Closed Positions:     {summary['closed_trades_count']} | Realized PnL: ${summary['realized_pnl']:+.2f}")
+                    print(f" Total Portfolio PnL:  ${summary['total_pnl']:+.2f} (ROI: {summary['roi_percent']:+.2f}%)")
+                    print(f" New Trades Placed:    {len(trades)}")
                     print("="*85)
                 elif iteration % 4 == 0:
                     # Periodic heartbeat summary
                     summary = bot.get_summary()
-                    logger.info(f"[HEARTBEAT] Bankroll: ${summary['current_bankroll']:.2f} | Active: {summary['active_positions_count']} | Next scan in {int(args.scan_interval - time_since_scan)}s")
+                    logger.info(f"[HEARTBEAT] Equity: ${summary['total_equity']:.2f} | Cash: ${summary['available_cash']:.2f} | Active: {summary['active_positions_count']} | Next scan in {int(args.scan_interval - time_since_scan)}s")
 
             except Exception as e:
                 logger.error(f"Unexpected error in trading loop: {e}", exc_info=True)

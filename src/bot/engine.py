@@ -97,8 +97,17 @@ class TradingBot:
         return sum(pos["total_cost"] for pos in self.active_positions.values())
 
     @property
+    def total_equity(self) -> float:
+        """Total account equity = Available Cash + Capital deployed in open positions."""
+        if self.mode == "live" and self.live_balance_loaded:
+            return self.bankroll + self.total_exposure
+        return self.bankroll
+
+    @property
     def available_cash(self) -> float:
         """Cash available for new trades."""
+        if self.mode == "live" and self.live_balance_loaded:
+            return max(0.0, self.bankroll)
         return max(0.0, self.bankroll - self.total_exposure)
 
     def sync_live_positions(self):
@@ -357,7 +366,7 @@ class TradingBot:
                 self.bankroll = live_bal["balance_dollars"]
             self.sync_live_positions()
 
-        logger.info(f"--- Starting {self.mode.upper()} Scan Cycle | Bankroll: ${self.bankroll:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")
+        logger.info(f"--- Starting {self.mode.upper()} Scan Cycle | Equity: ${self.total_equity:.2f} | Available Cash: ${self.available_cash:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")
         opportunities = self.scanner.scan_all_opportunities(dedup_by_event=True)
 
         entered_trades = []
@@ -369,16 +378,21 @@ class TradingBot:
             pos_key = f"{ticker}_{side}"
 
             price = opp["ask_price"]
-            # Sizing: 5% of total bankroll
-            contracts = self.risk_manager.calculate_position_size(self.bankroll, price)
+            # Sizing: 5% of total account equity
+            contracts = self.risk_manager.calculate_position_size(self.total_equity, price)
             if contracts <= 0:
                 continue
 
             total_cost = round(contracts * price, 2)
 
+            # Check available cash buffer
+            if total_cost > (self.available_cash + 0.01):
+                logger.info(f"Skipping {ticker} ({side}): Insufficient available cash (${self.available_cash:.2f} < ${total_cost:.2f})")
+                continue
+
             # Multi-layer risk validation
             approved, reason = self.risk_manager.validate_candidate_trade(
-                self.bankroll,
+                self.total_equity,
                 self.active_positions,
                 opp,
                 total_cost
@@ -446,16 +460,18 @@ class TradingBot:
 
     def get_summary(self) -> Dict[str, Any]:
         """Returns portfolio performance metrics."""
-        total_pnl = self.bankroll - self.initial_bankroll
+        realized_pnl = sum(pos.get("realized_pnl", 0.0) for pos in self.closed_positions)
+        total_pnl = self.total_equity - self.initial_bankroll
         roi = (total_pnl / self.initial_bankroll) * 100 if self.initial_bankroll > 0 else 0.0
         return {
             "mode": self.mode,
             "initial_bankroll": self.initial_bankroll,
-            "current_bankroll": round(self.bankroll, 2),
-            "active_exposure": round(self.total_exposure, 2),
+            "total_equity": round(self.total_equity, 2),
             "available_cash": round(self.available_cash, 2),
+            "active_exposure": round(self.total_exposure, 2),
             "active_positions_count": len(self.active_positions),
             "closed_trades_count": len(self.closed_positions),
+            "realized_pnl": round(realized_pnl, 2),
             "total_pnl": round(total_pnl, 2),
             "roi_percent": round(roi, 2)
         }
