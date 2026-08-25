@@ -102,7 +102,7 @@ def main():
         bot.monitor_active_positions()
         trades = bot.execute_scan_cycle()
         summary = bot.get_summary()
-        print(f"\n[SINGLE RUN COMPLETED] Placed {len(trades)} trade(s). Current Bankroll: ${summary['current_bankroll']:.2f}")
+        print(f"\n[SINGLE RUN COMPLETED] Placed {len(trades)} trade(s). Total Account Equity: ${summary['total_equity']:.2f} (Available Cash: ${summary['available_cash']:.2f})")
         return
 
     last_scan_time = 0.0

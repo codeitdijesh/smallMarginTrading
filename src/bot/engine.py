@@ -77,10 +77,11 @@ class TradingBot:
                 logger.error("Live mode requires valid Kalshi RSA credentials (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY). Defaulting to fallback bankroll.")
             else:
                 live_bal = self.client.get_balance()
-                if live_bal and "balance_dollars" in live_bal:
-                    bankroll = live_bal["balance_dollars"]
+                if live_bal and "available_cash" in live_bal:
+                    bankroll = live_bal["available_cash"]
+                    total_eq = live_bal.get("total_equity", bankroll)
                     self.live_balance_loaded = True
-                    logger.info(f"Retrieved Live Kalshi Balance: ${bankroll:.2f}")
+                    logger.info(f"Retrieved Live Kalshi Account -> Total Equity: ${total_eq:.2f} | Available Cash: ${bankroll:.2f} | Open Positions: ${live_bal.get('portfolio_value', 0.0):.2f}")
                 else:
                     logger.warning(f"Could not retrieve live balance from Kalshi API. Using fallback bankroll: ${bankroll:.2f}")
 
@@ -121,7 +122,7 @@ class TradingBot:
                 market_positions = positions_data.get("market_positions", [])
                 for mp in market_positions:
                     ticker = mp.get("ticker")
-                    pos_count = mp.get("position", 0)
+                    pos_count = int(float(mp.get("position_fp") or mp.get("position") or 0))
                     if not ticker or pos_count == 0:
                         continue
                     side = "yes" if pos_count > 0 else "no"
@@ -129,7 +130,8 @@ class TradingBot:
                     if pos_key not in self.active_positions:
                         event_ticker = ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
                         series_ticker = ticker.split("-")[0] if "-" in ticker else ticker
-                        entry_price = float(mp.get("market_exposure", 0)) / max(1, abs(pos_count)) if abs(pos_count) > 0 else 0.90
+                        exposure = float(mp.get("market_exposure_dollars") or mp.get("market_exposure") or 0.0)
+                        entry_price = exposure / max(1, abs(pos_count)) if abs(pos_count) > 0 else 0.90
                         self.active_positions[pos_key] = {
                             "ticker": ticker,
                             "event_ticker": event_ticker,
@@ -138,7 +140,7 @@ class TradingBot:
                             "side": side,
                             "entry_price": round(entry_price, 4),
                             "contracts": abs(pos_count),
-                            "total_cost": float(mp.get("market_exposure", 0)),
+                            "total_cost": round(exposure, 2),
                             "est_fee": 0.0,
                             "est_net_profit": 0.0,
                             "roi_percent": 0.0,
@@ -467,6 +469,7 @@ class TradingBot:
             "mode": self.mode,
             "initial_bankroll": self.initial_bankroll,
             "total_equity": round(self.total_equity, 2),
+            "current_bankroll": round(self.total_equity, 2),
             "available_cash": round(self.available_cash, 2),
             "active_exposure": round(self.total_exposure, 2),
             "active_positions_count": len(self.active_positions),
@@ -482,6 +485,9 @@ class TradingBot:
             "mode": self.mode,
             "bankroll": self.bankroll,
             "initial_bankroll": self.initial_bankroll,
+            "total_equity": round(self.total_equity, 2),
+            "available_cash": round(self.available_cash, 2),
+            "active_exposure": round(self.total_exposure, 2),
             "active_positions": self.active_positions,
             "closed_positions": self.closed_positions,
             "last_updated": datetime.now(timezone.utc).isoformat()
@@ -500,7 +506,11 @@ class TradingBot:
                     data = json.load(f)
                     if not (self.mode == "live" and self.live_balance_loaded):
                         self.bankroll = data.get("bankroll", self.bankroll)
-                        self.initial_bankroll = data.get("initial_bankroll", self.initial_bankroll)
+                    saved_initial = data.get("initial_bankroll")
+                    if saved_initial and saved_initial > 0:
+                        self.initial_bankroll = saved_initial
+                    else:
+                        self.initial_bankroll = self.total_equity if (self.mode == "live" and self.live_balance_loaded) else self.bankroll
                     self.active_positions = data.get("active_positions", {})
                     self.closed_positions = data.get("closed_positions", [])
                     logger.info(f"Loaded existing trading state from {self.state_file}")

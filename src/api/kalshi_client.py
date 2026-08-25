@@ -198,7 +198,7 @@ class KalshiClient:
 
     # Authenticated Portfolio & Order Management
     def get_balance(self) -> Optional[Dict[str, Any]]:
-        """Retrieves account balance and available cash."""
+        """Retrieves account balance, available cash, portfolio value, and total equity."""
         if not self.is_authenticated:
             logger.error("Cannot fetch balance: API Key ID or RSA Private Key is missing.")
             return None
@@ -207,9 +207,16 @@ class KalshiClient:
         if resp and resp.status_code == 200:
             data = resp.json()
             balance_cents = data.get("balance", 0)
+            portfolio_value_cents = data.get("portfolio_value", 0)
+            available_cash = round(balance_cents / 100.0, 2)
+            portfolio_value = round(portfolio_value_cents / 100.0, 2)
+            total_equity = round((balance_cents + portfolio_value_cents) / 100.0, 2)
             return {
                 "balance_cents": balance_cents,
-                "balance_dollars": round(balance_cents / 100.0, 2),
+                "balance_dollars": available_cash,
+                "available_cash": available_cash,
+                "portfolio_value": portfolio_value,
+                "total_equity": total_equity,
                 "raw": data
             }
         elif resp:
