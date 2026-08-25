@@ -72,25 +72,44 @@ class TradingBot:
         self.closed_positions: List[Dict[str, Any]] = []
 
         self.live_balance_loaded = False
+        self.live_portfolio_value = 0.0
+        self.live_total_equity = bankroll
+        self.bankroll = bankroll
+        self.initial_bankroll = bankroll
+
         if self.mode == "live":
             if not self.client.is_authenticated:
                 logger.error("Live mode requires valid Kalshi RSA credentials (KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY). Defaulting to fallback bankroll.")
             else:
-                live_bal = self.client.get_balance()
-                if live_bal and "available_cash" in live_bal:
-                    bankroll = live_bal["available_cash"]
-                    total_eq = live_bal.get("total_equity", bankroll)
-                    self.live_balance_loaded = True
-                    logger.info(f"Retrieved Live Kalshi Account -> Total Equity: ${total_eq:.2f} | Available Cash: ${bankroll:.2f} | Open Positions: ${live_bal.get('portfolio_value', 0.0):.2f}")
-                else:
-                    logger.warning(f"Could not retrieve live balance from Kalshi API. Using fallback bankroll: ${bankroll:.2f}")
+                self.refresh_live_balance()
 
-        self.bankroll = bankroll
-        self.initial_bankroll = bankroll
         self.load_state()
+
+        if self.mode == "live" and self.client.is_authenticated:
+            self.sync_live_positions()
 
         # Reconcile on startup to handle any trades resolved during offline periods
         self.reconcile_positions_on_startup()
+
+    def refresh_live_balance(self) -> Optional[Dict[str, Any]]:
+        """Refreshes live account balance, available cash, portfolio value, and equity from Kalshi API."""
+        if self.mode != "live" or not self.client.is_authenticated:
+            return None
+
+        live_bal = self.client.get_balance()
+        if live_bal and "available_cash" in live_bal:
+            self.bankroll = live_bal["available_cash"]
+            self.live_portfolio_value = live_bal.get("portfolio_value", 0.0)
+            self.live_total_equity = live_bal.get("total_equity", round(self.bankroll + self.live_portfolio_value, 2))
+            self.live_balance_loaded = True
+            logger.info(
+                f"Retrieved Live Kalshi Account -> Total Equity: ${self.live_total_equity:.2f} | "
+                f"Available Cash: ${self.bankroll:.2f} | Open Positions Value: ${self.live_portfolio_value:.2f}"
+            )
+            return live_bal
+        else:
+            logger.warning(f"Could not retrieve live balance from Kalshi API. Using current bankroll: ${self.bankroll:.2f}")
+            return None
 
     @property
     def total_exposure(self) -> float:
@@ -101,7 +120,7 @@ class TradingBot:
     def total_equity(self) -> float:
         """Total account equity = Available Cash + Capital deployed in open positions."""
         if self.mode == "live" and self.live_balance_loaded:
-            return self.bankroll + self.total_exposure
+            return round(self.bankroll + (self.live_portfolio_value if self.live_portfolio_value > 0 else self.total_exposure), 2)
         return self.bankroll
 
     @property
@@ -118,8 +137,9 @@ class TradingBot:
 
         try:
             positions_data = self.client.get_positions(status="open")
-            if positions_data:
+            if positions_data is not None:
                 market_positions = positions_data.get("market_positions", [])
+                live_pos_keys = set()
                 for mp in market_positions:
                     ticker = mp.get("ticker")
                     pos_count = int(float(mp.get("position_fp") or mp.get("position") or 0))
@@ -127,11 +147,13 @@ class TradingBot:
                         continue
                     side = "yes" if pos_count > 0 else "no"
                     pos_key = f"{ticker}_{side}"
+                    live_pos_keys.add(pos_key)
+                    exposure = float(mp.get("market_exposure_dollars") or (float(mp.get("market_exposure", 0)) / 100.0) or 0.0)
+                    entry_price = exposure / max(1, abs(pos_count)) if abs(pos_count) > 0 else 0.90
+
                     if pos_key not in self.active_positions:
                         event_ticker = ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
                         series_ticker = ticker.split("-")[0] if "-" in ticker else ticker
-                        exposure = float(mp.get("market_exposure_dollars") or mp.get("market_exposure") or 0.0)
-                        entry_price = exposure / max(1, abs(pos_count)) if abs(pos_count) > 0 else 0.90
                         self.active_positions[pos_key] = {
                             "ticker": ticker,
                             "event_ticker": event_ticker,
@@ -152,6 +174,22 @@ class TradingBot:
                             "synced_from_api": True,
                             "entered_at": datetime.now(timezone.utc).isoformat()
                         }
+                    else:
+                        self.active_positions[pos_key]["contracts"] = abs(pos_count)
+                        if exposure > 0:
+                            self.active_positions[pos_key]["total_cost"] = round(exposure, 2)
+
+                # Reconcile any positions in active_positions that are no longer open on Kalshi
+                stale_keys = [k for k, v in self.active_positions.items() if v.get("mode") == "live" and k not in live_pos_keys]
+                for k in stale_keys:
+                    logger.info(f"Reconciling stale live position not found on Kalshi: {k}")
+                    pos = self.active_positions.pop(k)
+                    pos["outcome"] = "CLOSED_ON_KALSHI"
+                    pos["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                    self.closed_positions.append(pos)
+
+                if stale_keys:
+                    self.save_state()
         except Exception as e:
             logger.warning(f"Could not sync live positions from API: {e}")
 
@@ -363,9 +401,7 @@ class TradingBot:
         4. Enter orders (Demo/Live API limit order)
         """
         if self.mode == "live" and self.client.is_authenticated:
-            live_bal = self.client.get_balance()
-            if live_bal and "balance_dollars" in live_bal:
-                self.bankroll = live_bal["balance_dollars"]
+            self.refresh_live_balance()
             self.sync_live_positions()
 
         logger.info(f"--- Starting {self.mode.upper()} Scan Cycle | Equity: ${self.total_equity:.2f} | Available Cash: ${self.available_cash:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")

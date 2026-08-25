@@ -239,3 +239,48 @@ def test_bot_startup_reconciliation_settled():
         assert len(bot.closed_positions) == 1
         assert bot.closed_positions[0]["outcome"] == "WIN"
 
+def test_live_balance_refresh_and_equity_accuracy():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        state_file = Path(tmp_dir) / "live_test_state.json"
+        
+        bot = TradingBot(
+            mode="live",
+            bankroll=500.0,
+            state_file=state_file
+        )
+
+        # Mock authenticated client methods
+        bot.client.key_id = "test_key"
+        bot.client.private_key = object()
+        bot.client.get_balance = lambda: {
+            "balance_cents": 215053,
+            "balance_dollars": 2150.53,
+            "available_cash": 2150.53,
+            "portfolio_value": 0.0,
+            "total_equity": 2150.53
+        }
+        bot.client.get_positions = lambda status="open": {
+            "market_positions": []
+        }
+
+        # Add a mock stale position in local state
+        bot.active_positions["KXSTALE-26AUG22_yes"] = {
+            "ticker": "KXSTALE-26AUG22",
+            "side": "yes",
+            "entry_price": 0.90,
+            "contracts": 50,
+            "total_cost": 45.0,
+            "mode": "live"
+        }
+
+        # Refresh balance and sync positions
+        bot.refresh_live_balance()
+        bot.sync_live_positions()
+
+        # Stale position should have been reconciled and removed from active
+        assert "KXSTALE-26AUG22_yes" not in bot.active_positions
+        # Equity should match the exact Kalshi live balance without ghost positions
+        assert bot.total_equity == 2150.53
+        assert bot.available_cash == 2150.53
+
+
