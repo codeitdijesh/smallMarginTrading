@@ -19,6 +19,8 @@ from pathlib import Path
 from config.settings import (
     BANKROLL_START,
     MAX_POSITION_SIZE_PERCENT,
+    MAX_ORDER_NOTIONAL_DOLLARS,
+    MAX_CONTRACTS_PER_ORDER,
     MAX_TOTAL_EXPOSURE_PERCENT,
     STOP_LOSS_PRICE_DROP,
     ENABLE_STOP_LOSS,
@@ -55,6 +57,8 @@ class TradingBot:
         self.scanner = scanner or MarketScanner(base_url=self.client.base_url)
         self.risk_manager = risk_manager or RiskManager(
             max_position_pct=MAX_POSITION_SIZE_PERCENT,
+            max_order_notional=MAX_ORDER_NOTIONAL_DOLLARS,
+            max_contracts_per_order=MAX_CONTRACTS_PER_ORDER,
             max_exposure_pct=MAX_TOTAL_EXPOSURE_PERCENT,
             stop_loss_drop=STOP_LOSS_PRICE_DROP,
             enable_stop_loss=ENABLE_STOP_LOSS,
@@ -70,6 +74,7 @@ class TradingBot:
         self.state_file = state_file or (BASE_DIR / f"{self.mode}_trading_state.json")
         self.active_positions: Dict[str, Dict[str, Any]] = {}
         self.closed_positions: List[Dict[str, Any]] = []
+        self.risk_lockdown_reasons: List[str] = []
 
         self.live_balance_loaded = False
         self.live_portfolio_value = 0.0
@@ -90,6 +95,7 @@ class TradingBot:
 
         # Reconcile on startup to handle any trades resolved during offline periods
         self.reconcile_positions_on_startup()
+        self.audit_active_risk(context="startup")
 
     def refresh_live_balance(self) -> Optional[Dict[str, Any]]:
         """Refreshes live account balance, available cash, portfolio value, and equity from Kalshi API."""
@@ -130,12 +136,50 @@ class TradingBot:
             return max(0.0, self.bankroll)
         return max(0.0, self.bankroll - self.total_exposure)
 
+    def _sync_live_resting_exit_orders(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Returns resting live exit orders keyed by local position key."""
+        if not hasattr(self.client, "get_orders"):
+            return None
+
+        try:
+            orders_data = self.client.get_orders(status="resting")
+        except Exception as e:
+            logger.warning(f"Could not sync live resting orders from API: {e}")
+            return None
+
+        if orders_data is None:
+            return None
+
+        if isinstance(orders_data, list):
+            raw_orders = orders_data
+        else:
+            raw_orders = orders_data.get("orders", [])
+        resting_exits: Dict[str, Dict[str, Any]] = {}
+
+        for order in raw_orders:
+            if not isinstance(order, dict):
+                continue
+
+            ticker = order.get("ticker") or order.get("market_ticker")
+            api_side = str(order.get("side") or order.get("order_side") or "").lower()
+            action = str(order.get("action") or order.get("trade_type") or "").lower()
+            if not ticker:
+                continue
+
+            for local_side in ("yes", "no"):
+                expected_api_side = "ask" if local_side == "yes" else "bid"
+                if api_side == expected_api_side or action == "sell":
+                    resting_exits[f"{ticker}_{local_side}"] = order
+
+        return resting_exits
+
     def sync_live_positions(self):
         """Syncs active positions and resting orders from Kalshi API when authenticated in live mode."""
         if self.mode != "live" or not self.client.is_authenticated:
             return
 
         try:
+            resting_exit_orders = self._sync_live_resting_exit_orders()
             positions_data = self.client.get_positions(status="open")
             if positions_data is not None:
                 market_positions = positions_data.get("market_positions", [])
@@ -169,15 +213,36 @@ class TradingBot:
                             "hours_left": 24.0,
                             "initial_hours": 24.0,
                             "breach_count": 0,
+                            "pending_entry": False,
+                            "pending_exit": False,
                             "close_time": "Live Position",
                             "mode": "live",
                             "synced_from_api": True,
                             "entered_at": datetime.now(timezone.utc).isoformat()
                         }
                     else:
+                        self.active_positions[pos_key]["pending_entry"] = False
                         self.active_positions[pos_key]["contracts"] = abs(pos_count)
                         if exposure > 0:
                             self.active_positions[pos_key]["total_cost"] = round(exposure, 2)
+
+                    if resting_exit_orders is not None:
+                        resting_exit = resting_exit_orders.get(pos_key)
+                        if resting_exit:
+                            self.active_positions[pos_key]["pending_exit"] = True
+                            self.active_positions[pos_key]["exit_order_id"] = (
+                                resting_exit.get("order_id") or resting_exit.get("client_order_id")
+                            )
+                            exit_price = (
+                                resting_exit.get("price")
+                                or resting_exit.get("yes_price")
+                                or resting_exit.get("no_price")
+                                or 0
+                            )
+                            self.active_positions[pos_key]["exit_limit_price"] = float(exit_price)
+                        else:
+                            self.active_positions[pos_key]["pending_exit"] = False
+                            self.active_positions[pos_key].pop("exit_order_id", None)
 
                 # Reconcile any positions in active_positions that are no longer open on Kalshi
                 stale_keys = [k for k, v in self.active_positions.items() if v.get("mode") == "live" and k not in live_pos_keys]
@@ -192,6 +257,27 @@ class TradingBot:
                     self.save_state()
         except Exception as e:
             logger.warning(f"Could not sync live positions from API: {e}")
+
+    def audit_active_risk(self, context: str = "runtime") -> List[str]:
+        """
+        Checks already-open positions against risk limits. Any violation puts the bot
+        in entry lockdown until the active portfolio is back within limits.
+        """
+        approved, violations = self.risk_manager.audit_active_positions(
+            self.total_equity,
+            self.active_positions
+        )
+        self.risk_lockdown_reasons = violations
+
+        if not approved:
+            logger.error(
+                f"[RISK LOCKDOWN:{context.upper()}] Active portfolio violates risk limits. "
+                "New trade entries are blocked until exposure is reduced."
+            )
+            for reason in violations:
+                logger.error(f"[RISK VIOLATION] {reason}")
+
+        return violations
 
     def reconcile_positions_on_startup(self):
         """
@@ -267,6 +353,10 @@ class TradingBot:
             contracts = pos["contracts"]
             total_cost = pos["total_cost"]
 
+            if pos.get("pending_entry"):
+                logger.info(f"[PENDING ENTRY] {ticker} ({side.upper()}) awaiting live fill confirmation; skipping stop-loss checks.")
+                continue
+
             quote = self.client.get_market_quote(ticker, side)
             if not quote:
                 continue
@@ -336,6 +426,13 @@ class TradingBot:
 
                 # 3. Check Multi-Tick Persistence Filter
                 if pos["breach_count"] >= self.risk_manager.stop_loss_persistence_ticks:
+                    if self.mode == "live" and pos.get("pending_exit"):
+                        logger.warning(
+                            f"[STOP LOSS PENDING] {ticker} ({side.upper()}) already has an exit order "
+                            f"pending confirmation: {pos.get('exit_order_id')}"
+                        )
+                        continue
+
                     logger.warning(f"[STOP LOSS TRIGGERED] Breach persisted for {pos['breach_count']} ticks. Executing sell exit for {ticker} ({side.upper()}) @ ${bid_price:.2f}...")
 
                     # Execute Live Limit Sell on Kalshi
@@ -351,6 +448,16 @@ class TradingBot:
                         if not order_response:
                             logger.error(f"Failed to place live stop-loss sell order for {ticker}. Retrying next cycle.")
                             continue
+                        pos["pending_exit"] = True
+                        pos["exit_order_id"] = order_response.get("order_id") or order_response.get("client_order_id")
+                        pos["exit_requested_at"] = now.isoformat()
+                        pos["exit_limit_price"] = bid_price
+                        logger.warning(
+                            f"[STOP LOSS ORDER SUBMITTED] {ticker} ({side.upper()}) sell limit submitted @ ${bid_price:.2f}. "
+                            "Keeping position active until Kalshi confirms the fill/position close."
+                        )
+                        self.save_state()
+                        continue
 
                     # Calculate Realized Loss with Exit Fee
                     exit_proceeds = round(bid_price * contracts, 2)
@@ -405,6 +512,12 @@ class TradingBot:
             self.sync_live_positions()
 
         logger.info(f"--- Starting {self.mode.upper()} Scan Cycle | Equity: ${self.total_equity:.2f} | Available Cash: ${self.available_cash:.2f} | Active Exposure: ${self.total_exposure:.2f} ---")
+        risk_violations = self.audit_active_risk(context="pre-scan")
+        if risk_violations:
+            logger.error(f"Skipping market scan: {len(risk_violations)} active risk violation(s) require attention first.")
+            self.save_state()
+            return []
+
         opportunities = self.scanner.scan_all_opportunities(dedup_by_event=True)
 
         entered_trades = []
@@ -478,6 +591,8 @@ class TradingBot:
                 "target_stop": self.risk_manager.calculate_dynamic_stop_price(price, hours_left, hours_left),
                 "close_time": opp["close_time"],
                 "mode": self.mode,
+                "pending_entry": self.mode == "live",
+                "pending_exit": False,
                 "order_id": order_response.get("order_id") if order_response else None,
                 "entered_at": datetime.now(timezone.utc).isoformat()
             }
@@ -524,6 +639,8 @@ class TradingBot:
             "total_equity": round(self.total_equity, 2),
             "available_cash": round(self.available_cash, 2),
             "active_exposure": round(self.total_exposure, 2),
+            "risk_lockdown": bool(self.risk_lockdown_reasons),
+            "risk_lockdown_reasons": self.risk_lockdown_reasons,
             "active_positions": self.active_positions,
             "closed_positions": self.closed_positions,
             "last_updated": datetime.now(timezone.utc).isoformat()
@@ -552,4 +669,3 @@ class TradingBot:
                     logger.info(f"Loaded existing trading state from {self.state_file}")
             except Exception as e:
                 logger.error(f"Error loading state from {self.state_file}: {e}")
-

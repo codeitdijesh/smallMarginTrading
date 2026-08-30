@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import (
     BANKROLL_START,
+    MAX_ORDER_NOTIONAL_DOLLARS,
+    MAX_CONTRACTS_PER_ORDER,
     PROD_API_URL,
     DEMO_API_URL,
     KALSHI_ENV,
@@ -74,6 +76,8 @@ def main():
         min_oi=MIN_OPEN_INTEREST
     )
     risk_manager = RiskManager(
+        max_order_notional=MAX_ORDER_NOTIONAL_DOLLARS,
+        max_contracts_per_order=MAX_CONTRACTS_PER_ORDER,
         max_positions_per_event=args.max_per_event,
         enable_stop_loss=args.stop_loss,
         stop_loss_type=args.stop_type,
@@ -150,4 +154,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

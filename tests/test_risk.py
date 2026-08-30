@@ -9,6 +9,32 @@ def test_position_sizing():
     assert contracts == 52
     assert contracts * price <= 50.0
 
+def test_position_sizing_respects_hard_caps():
+    risk = RiskManager(
+        max_position_pct=0.05,
+        max_order_notional=50.0,
+        max_contracts_per_order=40
+    )
+
+    contracts = risk.calculate_position_size(10000.0, 0.90)
+
+    assert contracts == 40
+    assert contracts * 0.90 <= 50.0
+
+def test_validate_candidate_trade_rejects_order_above_hard_cap():
+    risk = RiskManager(max_order_notional=50.0)
+    candidate = {
+        "ticker": "KXTEST-26AUG30-T100",
+        "event_ticker": "KXTEST-26AUG30",
+        "series_ticker": "KXTEST",
+        "side": "yes"
+    }
+
+    approved, reason = risk.validate_candidate_trade(10000.0, {}, candidate, 1000.0)
+
+    assert approved is False
+    assert "hard per-order cap" in reason
+
 def test_validate_exposure():
     risk = RiskManager(max_exposure_pct=0.75)
     bankroll = 1000.0
@@ -74,6 +100,31 @@ def test_validate_candidate_trade_prevents_multi_strike_same_event():
     assert approved is False
     assert "already has 1 active position" in reason
 
+def test_audit_active_positions_flags_existing_same_event_violation():
+    risk = RiskManager(max_positions_per_event=1, max_event_exposure_pct=0.05)
+    active_positions = {
+        "KXWTI-26AUG30-T81.49_no": {
+            "ticker": "KXWTI-26AUG30-T81.49",
+            "event_ticker": "KXWTI-26AUG30",
+            "series_ticker": "KXWTI",
+            "contracts": 1026,
+            "total_cost": 877.62
+        },
+        "KXWTI-26AUG30-T81.99_no": {
+            "ticker": "KXWTI-26AUG30-T81.99",
+            "event_ticker": "KXWTI-26AUG30",
+            "series_ticker": "KXWTI",
+            "contracts": 140,
+            "total_cost": 123.18
+        }
+    }
+
+    approved, violations = risk.audit_active_positions(1000.0, active_positions)
+
+    assert approved is False
+    assert any("Event KXWTI-26AUG30 has 2 active positions" in v for v in violations)
+    assert any("exceeds per-order cap" in v for v in violations)
+
 def test_validate_candidate_trade_allows_different_events():
     risk = RiskManager(max_positions_per_event=1, max_event_exposure_pct=0.05)
     bankroll = 1000.0
@@ -117,6 +168,19 @@ def test_dynamic_stop_loss_time_decay():
     # 6h left -> intermediate drop
     stop_6h = risk.calculate_dynamic_stop_price(entry_price, hours_left=6.0, total_hours=24.0)
     assert 0.55 < stop_6h < 0.75
+
+def test_dynamic_stop_loss_respects_fifty_cent_floor():
+    risk = RiskManager(
+        enable_stop_loss=True,
+        stop_loss_type="dynamic",
+        stop_loss_min_drop=0.15,
+        stop_loss_max_drop=0.35,
+        stop_loss_limit_floor=0.50
+    )
+
+    stop_24h = risk.calculate_dynamic_stop_price(0.80, hours_left=24.0, total_hours=24.0)
+
+    assert stop_24h == 0.50
 
 def test_stop_loss_evaluation_filters():
     risk = RiskManager(
@@ -173,4 +237,3 @@ def test_stop_loss_evaluation_filters():
     )
     assert should_exit is False
     assert "Bid depth" in reason and "minimum required depth" in reason
-

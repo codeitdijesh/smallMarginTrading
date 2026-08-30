@@ -5,9 +5,11 @@ strict event/series diversification to avoid multi-strike correlation risk,
 and stop-loss logic.
 """
 
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 from config.settings import (
     MAX_POSITION_SIZE_PERCENT,
+    MAX_ORDER_NOTIONAL_DOLLARS,
+    MAX_CONTRACTS_PER_ORDER,
     MAX_TOTAL_EXPOSURE_PERCENT,
     MAX_POSITIONS_PER_EVENT,
     MAX_EVENT_EXPOSURE_PERCENT,
@@ -29,6 +31,8 @@ class RiskManager:
     def __init__(
         self,
         max_position_pct: float = MAX_POSITION_SIZE_PERCENT,
+        max_order_notional: float = MAX_ORDER_NOTIONAL_DOLLARS,
+        max_contracts_per_order: int = MAX_CONTRACTS_PER_ORDER,
         max_exposure_pct: float = MAX_TOTAL_EXPOSURE_PERCENT,
         max_positions_per_event: int = MAX_POSITIONS_PER_EVENT,
         max_event_exposure_pct: float = MAX_EVENT_EXPOSURE_PERCENT,
@@ -46,6 +50,8 @@ class RiskManager:
         stop_loss_min_bid_depth: int = STOP_LOSS_MIN_BID_DEPTH
     ):
         self.max_position_pct = max_position_pct
+        self.max_order_notional = max_order_notional
+        self.max_contracts_per_order = max_contracts_per_order
         self.max_exposure_pct = max_exposure_pct
         self.max_positions_per_event = max_positions_per_event
         self.max_event_exposure_pct = max_event_exposure_pct
@@ -70,9 +76,14 @@ class RiskManager:
         if current_bankroll <= 0 or contract_price <= 0:
             return 0
         
-        max_capital_to_risk = current_bankroll * self.max_position_pct
+        max_capital_to_risk = min(
+            current_bankroll * self.max_position_pct,
+            self.max_order_notional
+        )
         # Number of contracts allowed
         contracts = int(max_capital_to_risk // contract_price)
+        if self.max_contracts_per_order > 0:
+            contracts = min(contracts, self.max_contracts_per_order)
         return max(0, contracts)
 
     def validate_candidate_trade(
@@ -98,6 +109,12 @@ class RiskManager:
         series_ticker = candidate.get("series_ticker") or (ticker.split("-")[0] if "-" in ticker else ticker)
 
         total_active_exposure = sum(pos.get("total_cost", 0.0) for pos in active_positions.values())
+
+        if self.max_order_notional > 0 and new_trade_cost > (self.max_order_notional + 0.01):
+            return False, (
+                f"Trade cost ${new_trade_cost:.2f} exceeds hard per-order cap "
+                f"(${self.max_order_notional:.2f})"
+            )
 
         # 1. Ticker duplication check
         for pos in active_positions.values():
@@ -152,6 +169,83 @@ class RiskManager:
             )
 
         return True, "Approved"
+
+    def audit_active_positions(
+        self,
+        current_bankroll: float,
+        active_positions: Dict[str, Dict[str, Any]]
+    ) -> Tuple[bool, List[str]]:
+        """
+        Audits already-open positions against the same portfolio constraints used for
+        new entries. This catches synced/manual/legacy exposure that bypassed entry checks.
+        """
+        violations = []
+        if current_bankroll <= 0:
+            return False, ["Bankroll is zero or negative."]
+
+        total_active_exposure = sum(pos.get("total_cost", 0.0) for pos in active_positions.values())
+        max_allowed_total = current_bankroll * self.max_exposure_pct
+        if total_active_exposure > (max_allowed_total + 0.01):
+            violations.append(
+                f"Total active exposure ${total_active_exposure:.2f} exceeds "
+                f"portfolio limit ${max_allowed_total:.2f}"
+            )
+
+        event_groups: Dict[str, List[Dict[str, Any]]] = {}
+        series_groups: Dict[str, List[Dict[str, Any]]] = {}
+
+        for pos_key, pos in active_positions.items():
+            ticker = pos.get("ticker", pos_key)
+            event_ticker = pos.get("event_ticker") or (ticker.rsplit("-", 1)[0] if "-" in ticker else ticker)
+            series_ticker = pos.get("series_ticker") or (ticker.split("-")[0] if "-" in ticker else ticker)
+            total_cost = float(pos.get("total_cost", 0.0) or 0.0)
+            contracts = int(float(pos.get("contracts", 0) or 0))
+
+            if self.max_order_notional > 0 and total_cost > (self.max_order_notional + 0.01):
+                violations.append(
+                    f"{ticker} position cost ${total_cost:.2f} exceeds per-order cap "
+                    f"${self.max_order_notional:.2f}"
+                )
+
+            if self.max_contracts_per_order > 0 and contracts > self.max_contracts_per_order:
+                violations.append(
+                    f"{ticker} contract count {contracts} exceeds per-order contract cap "
+                    f"{self.max_contracts_per_order}"
+                )
+
+            event_groups.setdefault(event_ticker, []).append(pos)
+            series_groups.setdefault(series_ticker, []).append(pos)
+
+        for event_ticker, positions in event_groups.items():
+            event_exposure = sum(pos.get("total_cost", 0.0) for pos in positions)
+            max_allowed_event_exposure = current_bankroll * self.max_event_exposure_pct
+            if len(positions) > self.max_positions_per_event:
+                tickers = ", ".join(pos.get("ticker", "") for pos in positions)
+                violations.append(
+                    f"Event {event_ticker} has {len(positions)} active positions "
+                    f"(max {self.max_positions_per_event}): {tickers}"
+                )
+            if event_exposure > (max_allowed_event_exposure + 0.01):
+                violations.append(
+                    f"Event {event_ticker} exposure ${event_exposure:.2f} exceeds "
+                    f"event limit ${max_allowed_event_exposure:.2f}"
+                )
+
+        for series_ticker, positions in series_groups.items():
+            series_exposure = sum(pos.get("total_cost", 0.0) for pos in positions)
+            max_allowed_series_exposure = current_bankroll * self.max_series_exposure_pct
+            if len(positions) > self.max_positions_per_series:
+                violations.append(
+                    f"Series {series_ticker} has {len(positions)} active positions "
+                    f"(max {self.max_positions_per_series})"
+                )
+            if series_exposure > (max_allowed_series_exposure + 0.01):
+                violations.append(
+                    f"Series {series_ticker} exposure ${series_exposure:.2f} exceeds "
+                    f"series limit ${max_allowed_series_exposure:.2f}"
+                )
+
+        return len(violations) == 0, violations
 
     def validate_exposure(self, current_bankroll: float, active_exposure: float, new_trade_cost: float) -> Tuple[bool, str]:
         """
@@ -252,4 +346,3 @@ class RiskManager:
             return True
         price_drop = entry_price - current_market_price
         return price_drop >= self.stop_loss_drop
-

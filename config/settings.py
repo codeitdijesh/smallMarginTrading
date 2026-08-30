@@ -59,6 +59,8 @@ MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "0.0"))           # Volume th
 # 4. Risk Management & Diversification (Anti-Overexposure)
 BANKROLL_START = 1000.0                                               # Initial virtual bankroll for paper trading ($)
 MAX_POSITION_SIZE_PERCENT = 0.05                                      # Risk fixed 5% of total bankroll per trade
+MAX_ORDER_NOTIONAL_DOLLARS = float(os.getenv("MAX_ORDER_NOTIONAL_DOLLARS", "50.0")) # Absolute cap per order; prevents account-growth or API/state bugs from oversizing
+MAX_CONTRACTS_PER_ORDER = int(os.getenv("MAX_CONTRACTS_PER_ORDER", "100"))          # Absolute contract count cap per order
 MAX_TOTAL_EXPOSURE_PERCENT = 0.75                                     # Never exceed 75% total active allocation
 MAX_POSITIONS_PER_EVENT = int(os.getenv("MAX_POSITIONS_PER_EVENT", "1"))           # Max 1 trade per underlying event (prevents betting on same event 10 times)
 MAX_EVENT_EXPOSURE_PERCENT = float(os.getenv("MAX_EVENT_EXPOSURE_PERCENT", "0.05"))# Max 5% bankroll exposure on any single event
@@ -72,7 +74,7 @@ STOP_LOSS_PRICE_DROP = float(os.getenv("STOP_LOSS_PRICE_DROP", "0.25")) # Base s
 STOP_LOSS_BASE_DROP = STOP_LOSS_PRICE_DROP
 STOP_LOSS_MIN_DROP = float(os.getenv("STOP_LOSS_MIN_DROP", "0.15"))   # Tighter drop tolerance close to expiry (e.g. 90c -> 75c)
 STOP_LOSS_MAX_DROP = float(os.getenv("STOP_LOSS_MAX_DROP", "0.35"))   # Wider drop tolerance when 18-24h remain (e.g. 90c -> 55c)
-STOP_LOSS_LIMIT_FLOOR = float(os.getenv("STOP_LOSS_LIMIT_FLOOR", "0.40")) # Hard floor: never panic-sell into pennies (< 40c)
+STOP_LOSS_LIMIT_FLOOR = float(os.getenv("STOP_LOSS_LIMIT_FLOOR", "0.50")) # Hard floor: dynamic stop never goes below 50c
 STOP_LOSS_PERSISTENCE_TICKS = int(os.getenv("STOP_LOSS_PERSISTENCE_TICKS", "2")) # Consecutive checks breach must persist (noise filter)
 STOP_LOSS_MAX_SPREAD = float(os.getenv("STOP_LOSS_MAX_SPREAD", "0.15"))# Ignore illiquid/ghost bids if spread > 15c
 STOP_LOSS_MIN_BID_DEPTH = int(os.getenv("STOP_LOSS_MIN_BID_DEPTH", "5")) # Min contracts at top bid to qualify as real liquidity
